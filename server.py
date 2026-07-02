@@ -154,6 +154,10 @@ class BatchRequest(BaseModel):
     texts: List[str]
 
 
+class EmbedRequest(BaseModel):
+    text: str = ""
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "model": MODEL_LABEL, "dims": DIMS}
@@ -162,6 +166,13 @@ def health() -> dict:
 @app.get("/embed")
 def embed(text: str = "") -> dict:
     return {"vector": embed_one(text), "dims": DIMS, "model": MODEL_LABEL}
+
+
+@app.post("/embed")
+def embed_post(req: EmbedRequest) -> dict:
+    # POST variant: a composed corpus doc can carry a multi-thousand-char plot, which as a GET ?text= query
+    # param risks a 414 (URI too long). Same contract/response as GET /embed.
+    return {"vector": embed_one(req.text), "dims": DIMS, "model": MODEL_LABEL}
 
 
 @app.post("/embed/batch")
