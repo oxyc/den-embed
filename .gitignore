@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# fastembed / huggingface model cache (the ~560 MB ONNX download)
+.fastembed_cache/
+.cache/
+models--*/

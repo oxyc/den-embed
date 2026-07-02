@@ -1,0 +1,9 @@
+# Runtime + test deps, pinned. Transitive deps (onnxruntime, tokenizers,
+# huggingface-hub, pydantic, starlette, ...) are resolved by these.
+fastembed==0.8.0
+fastapi==0.139.0
+uvicorn[standard]==0.49.0
+numpy==2.5.0
+# tests
+httpx==0.28.1
+pytest==9.1.1
