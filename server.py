@@ -23,6 +23,14 @@ MODEL_NAME = "BAAI/bge-m3"
 MODEL_LABEL = "bge-m3"  # the stable label the contract exposes
 DIMS = 1024
 
+# Memory safety: ONNX activation memory scales with (batch_size * sequence_length),
+# so a single large /embed/batch request of long plot docs can spike RAM and get the
+# process OOM-killed. Bound BOTH dimensions regardless of request size:
+#  - process the model in fixed sub-batches (never the whole request at once),
+#  - truncate absurdly long docs before tokenization (bge-m3 caps at 8192 tokens anyway).
+EMBED_BATCH = max(1, int(os.environ.get("DEN_EMBED_BATCH", "16")))
+MAX_CHARS = max(500, int(os.environ.get("DEN_EMBED_MAX_CHARS", "8000")))
+
 # fastembed 0.8 does not ship bge-m3 in its built-in registry, so we register it
 # as a custom model. We point at the int8-quantized ONNX export (Xenova/bge-m3,
 # onnx/model_int8.onnx) for a minimal on-disk / in-memory footprint. bge-m3 dense
@@ -102,15 +110,16 @@ def embed_one(text: str) -> List[int]:
     """
     if _is_blank(text):
         return _zero_vector()
-    vector = next(iter(get_model().embed([text])))
+    vector = next(iter(get_model().embed([text[:MAX_CHARS]])))
     return quantize_int8(vector)
 
 
 def embed_many(texts: List[str]) -> List[List[int]]:
-    """Embed a list of strings to int8 vectors in one efficient fastembed call.
+    """Embed a list of strings to int8 vectors, in fixed sub-batches to bound memory.
 
-    Blank entries are mapped to zero vectors without being sent to the model,
-    while the non-blank entries are embedded together in a single batch.
+    Blank entries are mapped to zero vectors without being sent to the model. The
+    non-blank entries are truncated to MAX_CHARS and fed to the model EMBED_BATCH at a
+    time (via fastembed's batch_size) so a large request can't OOM the process.
     """
     results: List[List[int] | None] = [None] * len(texts)
     to_embed: List[str] = []
@@ -120,10 +129,10 @@ def embed_many(texts: List[str]) -> List[List[int]]:
             results[i] = _zero_vector()
         else:
             positions.append(i)
-            to_embed.append(text)
+            to_embed.append(text[:MAX_CHARS])
 
     if to_embed:
-        for pos, vector in zip(positions, get_model().embed(to_embed)):
+        for pos, vector in zip(positions, get_model().embed(to_embed, batch_size=EMBED_BATCH)):
             results[pos] = quantize_int8(vector)
 
     return [r if r is not None else _zero_vector() for r in results]
