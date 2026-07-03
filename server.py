@@ -39,6 +39,12 @@ MAX_CHARS = max(500, int(os.environ.get("DEN_EMBED_MAX_CHARS", "8000")))
 MODEL_HF_REPO = "Xenova/bge-m3"
 MODEL_ONNX_FILE = "onnx/model_int8.onnx"
 
+# Where fastembed stores the ONNX model. Pinning it lets the Docker image BAKE the model at build time (a
+# warm-up step downloads it into this dir in an image layer); at runtime the model is already present, so there
+# is NO HuggingFace download on boot — which otherwise crash-loops a cold start with slow/blocked egress.
+# Unset (dev) → fastembed's default cache.
+CACHE_DIR = os.environ.get("FASTEMBED_CACHE_DIR") or None
+
 _registered = False
 
 # The model is loaded once and kept warm for the lifetime of the process — never
@@ -70,7 +76,7 @@ def get_model() -> TextEmbedding:
     global _model
     if _model is None:
         _register_model()
-        _model = TextEmbedding(model_name=MODEL_NAME)
+        _model = TextEmbedding(model_name=MODEL_NAME, cache_dir=CACHE_DIR)
     return _model
 
 
