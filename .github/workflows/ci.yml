@@ -3,7 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -17,9 +19,11 @@ jobs:
       - run: python -m pytest tests/ -q
 
   image:
-    # Build + push the model-baked image. Runs only on main after tests, so a cold start never downloads.
+    # Build + push the model-baked image ONLY on a v* tag (a deliberate release) or a manual run — NOT
+    # every main push. Tests still run on push/PR; the box updates only when you cut a tag. Matches the
+    # other addons.
     needs: test
-    if: github.ref == 'refs/heads/main'
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,4 +42,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:${{ github.sha }}
