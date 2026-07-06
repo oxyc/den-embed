@@ -223,7 +223,7 @@ async def lifespan(_app: "FastAPI"):
     yield
 
 
-app = FastAPI(title="den-embed", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="den-embed", version="1.1.0", lifespan=lifespan)
 
 
 @app.middleware("http")
