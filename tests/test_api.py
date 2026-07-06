@@ -65,3 +65,18 @@ def test_embed_batch_shape():
     assert len(body["vectors"]) == 3
     assert all(len(v) == DIMS for v in body["vectors"])
     assert body["vectors"][1] == [0] * DIMS
+
+
+def test_batch_cap_413():
+    """A batch over MAX_BATCH is rejected (DoS bound), not embedded."""
+    from server import MAX_BATCH
+    r = client.post("/embed/batch", json={"texts": ["x"] * (MAX_BATCH + 1)})
+    assert r.status_code == 413
+
+
+def test_embed_cache_is_transparent():
+    """A repeated identical query returns the byte-identical vector (served from the content cache)."""
+    q = {"text": "a heist thriller in paris"}
+    first = client.get("/embed", params=q).json()["vector"]
+    second = client.get("/embed", params=q).json()["vector"]
+    assert first == second

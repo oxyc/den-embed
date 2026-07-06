@@ -12,7 +12,10 @@ Output: L2-normalized dense vector, quantized to int8 via round(x*127) clamped t
 
 from __future__ import annotations
 
+import hashlib
 import os
+import threading
+from collections import OrderedDict
 from typing import List
 
 import numpy as np
@@ -30,6 +33,16 @@ DIMS = 1024
 #  - truncate absurdly long docs before tokenization (bge-m3 caps at 8192 tokens anyway).
 EMBED_BATCH = max(1, int(os.environ.get("DEN_EMBED_BATCH", "16")))
 MAX_CHARS = max(500, int(os.environ.get("DEN_EMBED_MAX_CHARS", "8000")))
+
+# DoS bounds on the batch endpoint (a large POST is otherwise buffered whole + allocates a slot per text).
+MAX_BATCH = max(1, int(os.environ.get("DEN_EMBED_MAX_BATCH", "512")))
+MAX_BODY_BYTES = max(64 * 1024, int(os.environ.get("DEN_EMBED_MAX_BODY_BYTES", str(4 * 1024 * 1024))))
+
+# Content cache: an embedding is DETERMINISTIC per (model, text[:MAX_CHARS]) — the whole point of the
+# one-canonical-quantization contract — so a repeated query (re-search, pagination, reconnect) is a dict
+# lookup instead of full ONNX inference (~50-300 ms on CPU). Bounded LRU; keyed with MODEL_LABEL so a model
+# swap never serves a stale vector. 0 disables.
+CACHE_MAX = max(0, int(os.environ.get("DEN_EMBED_CACHE_MAX", "8192")))
 
 # fastembed 0.8 does not ship bge-m3 in its built-in registry, so we register it
 # as a custom model. We point at the int8-quantized ONNX export (Xenova/bge-m3,
@@ -108,16 +121,54 @@ def _is_blank(text: str) -> bool:
     return text is None or text.strip() == ""
 
 
+# --- content cache (deterministic per model+text) --------------------------
+_cache: "OrderedDict[str, List[int]]" = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _cache_key(text: str) -> str:
+    # MODEL_LABEL folded in so a model swap can't serve a stale vector; text truncated exactly as inference is.
+    return hashlib.blake2b(
+        f"{MODEL_LABEL}\x00{text[:MAX_CHARS]}".encode("utf-8"), digest_size=16
+    ).hexdigest()
+
+
+def _cache_get(key: str) -> List[int] | None:
+    if CACHE_MAX <= 0:
+        return None
+    with _cache_lock:
+        vector = _cache.get(key)
+        if vector is not None:
+            _cache.move_to_end(key)
+        return vector
+
+
+def _cache_put(key: str, vector: List[int]) -> None:
+    if CACHE_MAX <= 0:
+        return
+    with _cache_lock:
+        _cache[key] = vector
+        _cache.move_to_end(key)
+        while len(_cache) > CACHE_MAX:
+            _cache.popitem(last=False)
+
+
 def embed_one(text: str) -> List[int]:
     """Embed a single string to an int8 vector.
 
     Empty/whitespace text returns an all-zero vector (the pipeline sends
     tag-only docs and occasionally empty strings — those must not error).
+    Deterministic, so a repeat is served from the content cache.
     """
     if _is_blank(text):
         return _zero_vector()
-    vector = next(iter(get_model().embed([text[:MAX_CHARS]])))
-    return quantize_int8(vector)
+    key = _cache_key(text)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    vector = quantize_int8(next(iter(get_model().embed([text[:MAX_CHARS]]))))
+    _cache_put(key, vector)
+    return vector
 
 
 def embed_many(texts: List[str]) -> List[List[int]]:
@@ -130,16 +181,25 @@ def embed_many(texts: List[str]) -> List[List[int]]:
     results: List[List[int] | None] = [None] * len(texts)
     to_embed: List[str] = []
     positions: List[int] = []
+    keys: List[str] = []
     for i, text in enumerate(texts):
         if _is_blank(text):
             results[i] = _zero_vector()
+            continue
+        key = _cache_key(text)
+        cached = _cache_get(key)
+        if cached is not None:
+            results[i] = cached
         else:
             positions.append(i)
             to_embed.append(text[:MAX_CHARS])
+            keys.append(key)
 
     if to_embed:
-        for pos, vector in zip(positions, get_model().embed(to_embed, batch_size=EMBED_BATCH)):
-            results[pos] = quantize_int8(vector)
+        for pos, key, vector in zip(positions, keys, get_model().embed(to_embed, batch_size=EMBED_BATCH)):
+            q = quantize_int8(vector)
+            results[pos] = q
+            _cache_put(key, q)
 
     return [r if r is not None else _zero_vector() for r in results]
 
@@ -150,7 +210,8 @@ def embed_many(texts: List[str]) -> List[List[int]]:
 
 from contextlib import asynccontextmanager  # noqa: E402
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 
@@ -163,6 +224,16 @@ async def lifespan(_app: "FastAPI"):
 
 
 app = FastAPI(title="den-embed", version="1.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    # Reject an over-cap body by its declared Content-Length before it's buffered (uvicorn otherwise reads
+    # the whole JSON into memory). A lying/chunked body is still bounded by MAX_BATCH + MAX_CHARS downstream.
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "request body too large"})
+    return await call_next(request)
 
 
 class BatchRequest(BaseModel):
@@ -192,6 +263,8 @@ def embed_post(req: EmbedRequest) -> dict:
 
 @app.post("/embed/batch")
 def embed_batch(req: BatchRequest) -> dict:
+    if len(req.texts) > MAX_BATCH:
+        raise HTTPException(status_code=413, detail=f"too many texts (max {MAX_BATCH})")
     return {"vectors": embed_many(req.texts), "dims": DIMS, "model": MODEL_LABEL}
 
 
