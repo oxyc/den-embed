@@ -12,9 +12,11 @@ Output: L2-normalized dense vector, quantized to int8 via round(x*127) clamped t
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import threading
+import time
 from collections import OrderedDict
 from typing import List
 
@@ -60,9 +62,15 @@ CACHE_DIR = os.environ.get("FASTEMBED_CACHE_DIR") or None
 
 _registered = False
 
-# The model is loaded once and kept warm for the lifetime of the process — never
-# reloaded per request.
+# The model is loaded lazily and kept warm. With DEN_EMBED_IDLE_UNLOAD_SEC > 0 it is
+# ALSO unloaded after that many idle seconds and lazy-reloaded on the next request:
+# for a service that is idle most of the day, this frees the ~750 MB bge-m3 ONNX model
+# (RAM falls to the Python + cache baseline) at the cost of a ~5-15 s cold start on the
+# first request after an idle gap. Default 0 preserves the always-warm behavior.
+IDLE_UNLOAD_SEC = max(0, int(os.environ.get("DEN_EMBED_IDLE_UNLOAD_SEC", "0")))
 _model: TextEmbedding | None = None
+_model_lock = threading.RLock()
+_last_used = 0.0
 
 
 def _register_model() -> None:
@@ -86,11 +94,27 @@ def _register_model() -> None:
 
 
 def get_model() -> TextEmbedding:
+    global _model, _last_used
+    with _model_lock:
+        if _model is None:
+            _register_model()
+            _model = TextEmbedding(model_name=MODEL_NAME, cache_dir=CACHE_DIR)
+        _last_used = time.monotonic()
+        return _model
+
+
+def _unload_when_idle() -> None:
+    # Background daemon: drop the model once it has been idle for IDLE_UNLOAD_SEC. An
+    # in-flight embed holds its own local reference to the model object, so clearing the
+    # global here is safe mid-request — the object lives until that call returns.
     global _model
-    if _model is None:
-        _register_model()
-        _model = TextEmbedding(model_name=MODEL_NAME, cache_dir=CACHE_DIR)
-    return _model
+    poll = max(15.0, min(60.0, IDLE_UNLOAD_SEC / 2))
+    while True:
+        time.sleep(poll)
+        with _model_lock:
+            if _model is not None and (time.monotonic() - _last_used) >= IDLE_UNLOAD_SEC:
+                _model = None
+                gc.collect()
 
 
 def quantize_int8(vector: np.ndarray) -> List[int]:
@@ -217,9 +241,12 @@ from pydantic import BaseModel  # noqa: E402
 
 @asynccontextmanager
 async def lifespan(_app: "FastAPI"):
-    # Load the model at boot so the first request is not cold, and keep it warm
-    # for the process lifetime.
-    get_model()
+    if IDLE_UNLOAD_SEC > 0:
+        # Start unloaded; load lazily on the first request, then unload after idle.
+        threading.Thread(target=_unload_when_idle, daemon=True).start()
+    else:
+        # Load at boot so the first request is not cold; keep warm for the process life.
+        get_model()
     yield
 
 
