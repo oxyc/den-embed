@@ -1,0 +1,7 @@
+# Dev/test deps. Used by CI (`pip install -r requirements-dev.txt`) and local dev.
+# The Dockerfile installs requirements.txt only, so pytest never reaches the image.
+-r requirements.txt
+# starlette's TestClient imports httpx directly, so pin it here. Note it ALSO arrives at runtime
+# transitively (huggingface_hub/fastapi/starlette depend on it) — it is in the image either way.
+httpx==0.28.1
+pytest==9.1.1
