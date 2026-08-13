@@ -42,8 +42,14 @@ fn ort_err(e: ort::Error) -> anyhow::Error {
 
 // glibc-only: return free heap arenas to the OS after the model is dropped. Not
 // exposed by the `libc` crate, so declare it directly (the image is glibc/debian).
+// Guarded for Linux so the service still builds on macOS (dev); a no-op elsewhere.
+#[cfg(target_os = "linux")]
 extern "C" {
     fn malloc_trim(pad: usize) -> i32;
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn malloc_trim(_pad: usize) -> i32 {
+    0
 }
 
 // --- config from env (same names/defaults as server.py) --------------------
