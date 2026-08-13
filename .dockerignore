@@ -1,9 +1,6 @@
+target/
 .venv/
-__pycache__/
-*.pyc
 .git/
-.github/
-tests/
-.pytest_cache/
-.fastembed_cache/
 *.md
+tests/
+__pycache__/

@@ -1,0 +1,39 @@
+[package]
+name = "den-embed"
+version = "2.0.0"
+edition = "2021"
+description = "bge-m3 int8 embedding service for den-atlas semantic search (Rust rewrite of the Python service)"
+license = "MIT"
+
+[[bin]]
+name = "den-embed"
+path = "src/main.rs"
+
+[profile.release]
+# Small, fast binary: fat LTO + one codegen unit + strip symbols. The image size
+# is dominated by the 555 MB ONNX model, but a lean binary keeps the non-model
+# layers tiny and helps cold-start.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]
+# ONNX Runtime — the SAME native engine the Python service used via fastembed, so
+# the same model_int8.onnx on the same CPU provider yields identical tensors.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries"] }
+ndarray = "0.16"
+# HuggingFace tokenizers — the SAME Rust crate fastembed wraps, so loading the
+# same tokenizer.json gives byte-identical token ids.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# blake2b-128 to reproduce the Python content-cache key exactly (digest_size=16).
+blake2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

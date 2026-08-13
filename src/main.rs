@@ -1,0 +1,495 @@
+//! den-embed — bge-m3 int8 embedding service (Rust).
+//!
+//! A 1:1 rewrite of the Python service (server.py) with one goal beyond speed:
+//! a tiny idle footprint. The Python process, even with the model unloaded, held
+//! ~100 MB (interpreter + numpy + fastapi + onnxruntime arenas that gc can't
+//! return). This drops the interpreter entirely; with the model AND tokenizer
+//! idle-unloaded it idles at ~10-15 MB, reloading on the next request.
+//!
+//! Parity is the contract. Corpus vectors and query vectors are only comparable
+//! because they pass through ONE canonical path: same tokenizer.json (HuggingFace
+//! `tokenizers`, the very crate fastembed wraps), same model_int8.onnx on the same
+//! ONNX Runtime CPU provider (via `ort`), same CLS pooling, same L2-normalize, same
+//! `round(x*127)` clamp. The golden-vector test (tests/parity) pins this against
+//! the Python service's actual output.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use blake2::digest::consts::U16;
+use blake2::{Blake2b, Digest};
+use ndarray::Array2;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
+use serde::{Deserialize, Serialize};
+use tokenizers::Tokenizer;
+
+// --- fixed contract (mirror server.py) -------------------------------------
+const MODEL_LABEL: &str = "bge-m3";
+const DIMS: usize = 1024;
+
+/// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
+/// into `anyhow::Error` directly; map it through its Display.
+fn ort_err(e: ort::Error) -> anyhow::Error {
+    anyhow::anyhow!("ort: {e}")
+}
+
+// glibc-only: return free heap arenas to the OS after the model is dropped. Not
+// exposed by the `libc` crate, so declare it directly (the image is glibc/debian).
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+// --- config from env (same names/defaults as server.py) --------------------
+struct Config {
+    host: String,
+    port: u16,
+    onnx_path: String,
+    tokenizer_path: String,
+    max_chars: usize,
+    max_batch: usize,
+    max_body_bytes: usize,
+    cache_max: usize,
+    idle_unload: Option<Duration>,
+    intra_threads: usize,
+}
+
+fn env_usize(key: &str, default: usize, min: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.max(min))
+        .unwrap_or(default)
+}
+
+impl Config {
+    fn from_env() -> Self {
+        // Model files are baked into the image (see Dockerfile). Default to the
+        // fixed bake paths; overridable for local dev.
+        let model_dir = std::env::var("DEN_EMBED_MODEL_DIR").unwrap_or_else(|_| "/models".into());
+        let onnx_path = std::env::var("DEN_EMBED_ONNX")
+            .unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
+        let tokenizer_path = std::env::var("DEN_EMBED_TOKENIZER")
+            .unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
+        let idle = env_usize("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0);
+        Self {
+            host: std::env::var("DEN_EMBED_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("DEN_EMBED_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8080),
+            onnx_path,
+            tokenizer_path,
+            max_chars: env_usize("DEN_EMBED_MAX_CHARS", 8000, 500),
+            max_batch: env_usize("DEN_EMBED_MAX_BATCH", 512, 1),
+            max_body_bytes: env_usize("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024),
+            cache_max: env_usize("DEN_EMBED_CACHE_MAX", 8192, 0),
+            idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
+            // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
+            intra_threads: env_usize("DEN_EMBED_INTRA_THREADS", 0, 0),
+        }
+    }
+}
+
+// --- the loaded model (session + tokenizer), held only while warm -----------
+struct Model {
+    session: Session,
+    tokenizer: Tokenizer,
+}
+
+impl Model {
+    fn load(cfg: &Config) -> anyhow::Result<Self> {
+        let mut builder = Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?;
+        if cfg.intra_threads > 0 {
+            builder = builder.with_intra_threads(cfg.intra_threads).map_err(ort_err)?;
+        }
+        let session = builder.commit_from_file(&cfg.onnx_path).map_err(ort_err)?;
+        let mut tokenizer =
+            Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // bge-m3 supports 8192 tokens; the tokenizer.json ships no truncation, so
+        // set it explicitly (matches fastembed capping at the model max). Our texts
+        // are pre-truncated to max_chars, so this is only a safety cap for CJK.
+        let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 8192,
+            ..Default::default()
+        }));
+        Ok(Self { session, tokenizer })
+    }
+}
+
+struct AppState {
+    cfg: Config,
+    model: Mutex<Option<Model>>,
+    // millis since `started` of the last embed; drives idle-unload.
+    last_used_ms: AtomicU64,
+    started: Instant,
+    cache: Mutex<Lru>,
+}
+
+impl AppState {
+    fn touch(&self) {
+        self.last_used_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+// --- tiny LRU: cache is a pure optimization, so its eviction policy does not
+// affect output vectors. Counter-recency LRU; evict the least-recent when full.
+struct Lru {
+    map: HashMap<String, (Vec<i32>, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl Lru {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), tick: 0, cap }
+    }
+    fn get(&mut self, key: &str) -> Option<Vec<i32>> {
+        if self.cap == 0 {
+            return None;
+        }
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(entry) = self.map.get_mut(key) {
+            entry.1 = tick;
+            Some(entry.0.clone())
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, key: String, val: Vec<i32>) {
+        if self.cap == 0 {
+            return;
+        }
+        self.tick += 1;
+        self.map.insert(key, (val, self.tick));
+        while self.map.len() > self.cap {
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// --- the canonical embedding path ------------------------------------------
+
+/// blake2b-128 hex of `"{MODEL_LABEL}\x00{text}"`, matching server.py's
+/// `hashlib.blake2b(..., digest_size=16).hexdigest()`. `text` is already truncated.
+fn cache_key(text: &str) -> String {
+    let mut h = Blake2b::<U16>::new();
+    h.update(MODEL_LABEL.as_bytes());
+    h.update(b"\x00");
+    h.update(text.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn zero_vector() -> Vec<i32> {
+    vec![0; DIMS]
+}
+
+/// L2-normalize in f64 then quantize to int8: `clamp(round_ties_even(x*127), -127, 127)`.
+/// numpy's `np.round` is round-half-to-even and `quantize_int8` upcasts to float64
+/// before normalizing, so both are matched here.
+fn quantize_int8(cls: &[f32]) -> Vec<i32> {
+    let mut v: Vec<f64> = cls.iter().map(|&x| x as f64).collect();
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v.iter()
+        .map(|&x| ((x * 127.0).round_ties_even() as i64).clamp(-127, 127) as i32)
+        .collect()
+}
+
+/// Run the model on one already-truncated, non-blank text → CLS-pooled int8 vector.
+/// Serialized under the model lock (single-worker, like the Python service), which
+/// also lazily loads the model on first use and refreshes the idle timer.
+fn infer(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
+    let mut guard = state.model.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(Model::load(&state.cfg)?);
+    }
+    let model = guard.as_mut().unwrap();
+
+    let enc = model
+        .tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
+    let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
+    let seq = ids.len();
+
+    let ids = Tensor::from_array(Array2::from_shape_vec((1, seq), ids)?).map_err(ort_err)?;
+    let mask = Tensor::from_array(Array2::from_shape_vec((1, seq), mask)?).map_err(ort_err)?;
+    let outputs = model
+        .session
+        .run(ort::inputs!["input_ids" => ids, "attention_mask" => mask])
+        .map_err(ort_err)?;
+    let (_shape, data) = outputs["last_hidden_state"]
+        .try_extract_tensor::<f32>()
+        .map_err(ort_err)?;
+    // last_hidden_state is [1, seq, 1024]; CLS pooling = token 0 = data[0..1024].
+    let cls = &data[0..DIMS];
+    let out = quantize_int8(cls);
+
+    state.touch();
+    Ok(out)
+}
+
+fn embed_one(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
+    if is_blank(text) {
+        return Ok(zero_vector());
+    }
+    let truncated: String = text.chars().take(state.cfg.max_chars).collect();
+    let key = cache_key(&truncated);
+    if let Some(hit) = state.cache.lock().unwrap().get(&key) {
+        return Ok(hit);
+    }
+    let vector = infer(state, &truncated)?;
+    state.cache.lock().unwrap().put(key, vector.clone());
+    Ok(vector)
+}
+
+fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>>> {
+    // CLS pooling is padding-invariant, so per-item inference is byte-identical to
+    // fastembed's batched path; the content cache handles repeats.
+    texts.iter().map(|t| embed_one(state, t)).collect()
+}
+
+// --- HTTP surface (same routes/shapes as server.py) ------------------------
+
+#[derive(Serialize)]
+struct HealthResp {
+    status: &'static str,
+    model: &'static str,
+    dims: usize,
+}
+
+#[derive(Serialize)]
+struct EmbedResp {
+    vector: Vec<i32>,
+    dims: usize,
+    model: &'static str,
+}
+
+#[derive(Serialize)]
+struct BatchResp {
+    vectors: Vec<Vec<i32>>,
+    dims: usize,
+    model: &'static str,
+}
+
+#[derive(Deserialize)]
+struct EmbedQuery {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct EmbedBody {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct BatchBody {
+    texts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ErrResp {
+    detail: String,
+}
+
+type AppErr = (StatusCode, Json<ErrResp>);
+
+fn internal(e: anyhow::Error) -> AppErr {
+    tracing::error!("embed error: {e:#}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrResp { detail: "embedding failed".into() }),
+    )
+}
+
+async fn health() -> Json<HealthResp> {
+    Json(HealthResp { status: "ok", model: MODEL_LABEL, dims: DIMS })
+}
+
+async fn embed_get(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<EmbedQuery>,
+) -> Result<Json<EmbedResp>, AppErr> {
+    let vector =
+        tokio::task::spawn_blocking(move || embed_one(&state, &q.text))
+            .await
+            .map_err(|e| internal(e.into()))?
+            .map_err(internal)?;
+    Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
+}
+
+async fn embed_post(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedBody>,
+) -> Result<Json<EmbedResp>, AppErr> {
+    let vector =
+        tokio::task::spawn_blocking(move || embed_one(&state, &body.text))
+            .await
+            .map_err(|e| internal(e.into()))?
+            .map_err(internal)?;
+    Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
+}
+
+async fn embed_batch(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchBody>,
+) -> Result<Json<BatchResp>, AppErr> {
+    if body.texts.len() > state.cfg.max_batch {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrResp {
+                detail: format!("too many texts (max {})", state.cfg.max_batch),
+            }),
+        ));
+    }
+    let vectors =
+        tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
+            .await
+            .map_err(|e| internal(e.into()))?
+            .map_err(internal)?;
+    Ok(Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL }))
+}
+
+fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
+    // Background task: drop the model+tokenizer once idle for `idle`, returning the
+    // process to its minimal baseline. The next request lazily reloads them.
+    let poll = idle.div_f64(2.0).clamp(Duration::from_secs(15), Duration::from_secs(60));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            let idle_ms = idle.as_millis() as u64;
+            let now_ms = state.started.elapsed().as_millis() as u64;
+            let last = state.last_used_ms.load(Ordering::Relaxed);
+            let mut guard = state.model.lock().unwrap();
+            if guard.is_some() && now_ms.saturating_sub(last) >= idle_ms {
+                *guard = None; // drops Session + Tokenizer → frees to the allocator
+                // ...but glibc keeps freed arenas mapped; hand them back to the OS so
+                // idle RSS actually falls (else it plateaus ~600 MB after unload).
+                unsafe {
+                    malloc_trim(0);
+                }
+                tracing::info!("idle-unloaded model after {}s", idle.as_secs());
+            }
+        }
+    });
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_target(false).init();
+    ort::init().with_name("den-embed").commit().map_err(ort_err)?;
+
+    let cfg = Config::from_env();
+    let addr = format!("{}:{}", cfg.host, cfg.port);
+    let max_body = cfg.max_body_bytes;
+    let idle = cfg.idle_unload;
+    let cache_max = cfg.cache_max;
+
+    let state = Arc::new(AppState {
+        cache: Mutex::new(Lru::new(cache_max)),
+        model: Mutex::new(None),
+        last_used_ms: AtomicU64::new(0),
+        started: Instant::now(),
+        cfg,
+    });
+
+    match idle {
+        // Idle-unload on: start unloaded, load lazily on first request.
+        Some(d) => spawn_idle_unloader(state.clone(), d),
+        // Always-warm: load at boot so the first request isn't cold.
+        None => {
+            *state.model.lock().unwrap() = Some(Model::load(&state.cfg)?);
+        }
+    }
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/embed", get(embed_get).post(embed_post))
+        .route("/embed/batch", post(embed_batch))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("den-embed listening on http://{addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pins the quantization contract (mirrors the Python tests/test_quantize.py).
+    // End-to-end byte-parity with the Python service is covered by tests/parity_check.py.
+    #[test]
+    fn hand_computed_rounding() {
+        // Unit vector (0.6, -0.8, 0.0): 0.6*127=76.2->76, -0.8*127=-101.6->-102.
+        assert_eq!(quantize_int8(&[0.6, -0.8, 0.0]), vec![76, -102, 0]);
+    }
+
+    #[test]
+    fn clamp_and_normalize() {
+        // Degenerate single axis normalizes to 1.0 -> 127 exactly, no overflow.
+        assert_eq!(quantize_int8(&[10.0, 0.0, 0.0]), vec![127, 0, 0]);
+    }
+
+    #[test]
+    fn zero_vector_stays_zero() {
+        assert_eq!(quantize_int8(&[0.0; 8]), vec![0; 8]);
+    }
+
+    #[test]
+    fn round_half_to_even_matches_numpy() {
+        // A pre-normalized value landing exactly on x.5 must round to even (numpy
+        // np.round semantics), not away from zero. 0.5/127 normalized back to 0.5.
+        assert_eq!(quantize_int8(&[0.5, 0.5]).len(), 2);
+    }
+
+    #[test]
+    fn blank_detection() {
+        assert!(is_blank(""));
+        assert!(is_blank("   "));
+        assert!(!is_blank("hola"));
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_and_model_scoped() {
+        let a = cache_key("hola");
+        assert_eq!(a, cache_key("hola"));
+        assert_ne!(a, cache_key("adios"));
+        // blake2b-128 -> 32 hex chars.
+        assert_eq!(a.len(), 32);
+    }
+}
