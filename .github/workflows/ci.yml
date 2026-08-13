@@ -12,13 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # requirements-dev.txt pulls in requirements.txt plus the test-only deps (pytest, httpx),
-      # which the image deliberately does not install.
-      - run: pip install -r requirements-dev.txt
-      - run: python -m pytest tests/ -q
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Contract unit tests (quantize / cache-key / blank handling). ort downloads
+      # ONNX Runtime during the build; the unit tests don't touch the model. The
+      # end-to-end byte-parity gate (tests/parity_check.py) is run manually against
+      # a live instance + golden vectors, not in CI.
+      - run: cargo test --locked
 
   image:
     # Build + push the model-baked image ONLY on a v* tag (a deliberate release) or a manual run — NOT
