@@ -39,3 +39,23 @@ app — and therefore any embedding demand — is idle most of the day. `0` keep
 
 The idle floor (~25 MB) is the statically-linked ONNX Runtime's resident code/data; getting nearer to
 zero would mean scaling the whole container down, which atlas's internal-DNS access doesn't cheaply allow.
+
+## Engine / model — evaluated 2026-08, stay on int8 + ORT (don't re-litigate for footprint)
+
+Measured a full sweep of lighter/faster options. **int8 + ONNX Runtime is the sweet spot.** Summary so it
+isn't re-explored:
+
+| option | verdict |
+|---|---|
+| **int8 + ORT (this)** | baseline — idle 43 MB, warm 1.2 GB, image 690 MB, cold 1.3 s, byte-parity |
+| fp16 (ORT or Candle) | **only quality-positive: +1.5% nDCG / +4% MRR** (measured, plotless corpus) — but needs a full corpus re-embed, ~2× model/warm, slower cold. Quality-only play, not footprint. |
+| q4 GGUF | **worse** than int8 (−8% nDCG). Dead. |
+| smaller model (e5-small) | **worse** (−12.5% nDCG), only faster. Dead. |
+| llama.cpp GGUF | bigger image (~1.5 GB), ~767 MB idle (no unload), slower. Eliminated. |
+| Candle (pure Rust) | bge-m3 works but **f16-only** (no int8/GGUF path); idle ~10–15 MB but image 1.08 GB, cold ~3 s + re-embed. |
+
+The big win already happened (Python 101 MB → Rust 43 MB idle). Idle-unload means at rest it's 43 MB —
+trivial — so there's no footprint left worth chasing; every measured cut trades quality. Revisit only if
+the goal becomes *quality* (then fp16, gated on a corpus re-embed + a plot-fetch eval for the true gap —
+this eval used plotless facts+tags docs and likely understates fp16). Retrieval-eval harness is
+rebuildable from atlas-data's `labels-t02.json` + `metadata`.
