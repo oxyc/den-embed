@@ -45,14 +45,24 @@ fn signal(child: &Child, sig: i32) {
     unsafe { kill(child.id() as i32, sig) };
 }
 
+/// Everything the server printed, shared with the draining thread.
+type Log = std::sync::Arc<std::sync::Mutex<String>>;
+
 /// Start den-embed on an ephemeral port and wait until it reports the port it bound.
 fn start() -> (Child, u16) {
-    start_with(&[])
+    let (c, p, _) = start_logged(&[]);
+    (c, p)
 }
 
-/// Same, with extra environment. Ambient `DEN_EMBED_*` is cleared: a developer with
-/// `DEN_EMBED_DRAIN_GRACE_SEC` exported would otherwise silently change three tests' timing.
 fn start_with(extra: &[(&str, &str)]) -> (Child, u16) {
+    let (c, p, _) = start_logged(extra);
+    (c, p)
+}
+
+/// Same, but keeping the server's output — the only way to assert on something it says rather than
+/// on timing. Ambient `DEN_EMBED_*` is cleared: a developer with `DEN_EMBED_DRAIN_GRACE_SEC`
+/// exported would otherwise silently change several tests' timing.
+fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_den-embed"));
     for (k, _) in std::env::vars() {
         if k.starts_with("DEN_EMBED_") {
@@ -76,25 +86,56 @@ fn start_with(extra: &[(&str, &str)]) -> (Child, u16) {
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let mut port = None;
+    let mut seen = String::new();
     for _ in 0..20 {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             break;
         }
+        seen.push_str(&line);
         if let Some(rest) = line.split("(port ").nth(1) {
             port = rest.trim_end().trim_end_matches(')').parse().ok();
             break;
         }
     }
     let port: u16 = port.expect("the binary never reported a listening port");
-    // Keep draining stdout so the pipe cannot fill and block the child.
+    // Keep draining stdout so the pipe cannot fill and block the child, and keep what it said.
+    let log: Log = std::sync::Arc::new(std::sync::Mutex::new(seen));
+    let sink = log.clone();
+    let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = drained.clone();
     std::thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            sink.lock().unwrap().push_str(&line);
+            line.clear();
         }
+        // EOF: the child closed stdout, so everything it ever wrote is now in the buffer.
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
     });
-    (child, port)
+    DRAINED.lock().unwrap().push(drained);
+    (child, port, log)
+}
+
+/// EOF flags for the log-draining threads, so a test can wait for one rather than racing it.
+static DRAINED: std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The server's full output, once its stdout has actually reached EOF.
+///
+/// Reading the buffer straight after `wait_within` races the draining thread: the last line is
+/// written microseconds before `_exit` while the poll interval is 25ms, so under load the assertion
+/// would fail with the maximally confusing "no inference was in flight".
+fn log_after_exit(log: &Log) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let all_done = DRAINED.lock().unwrap().iter().all(|d| d.load(std::sync::atomic::Ordering::SeqCst));
+        if all_done || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    log.lock().unwrap().clone()
 }
 
 /// A client holding half a request head must not hold shutdown open indefinitely. Nothing in the
@@ -189,6 +230,27 @@ fn an_in_flight_request_completes_across_a_stop() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// An over-large grace is clamped, and says so.
+///
+/// The ceiling is what keeps the drain finishing before something outside kills us — podman's
+/// default is 10s and the box's container still reports `StopTimeout=10` — so a grace above it is
+/// not a longer drain, it is a SIGKILL mid-drain. The clamp shipped without a test: deleting it
+/// from `drain_grace()` left the whole suite passing. This costs no wall clock, because it asserts
+/// on the warning rather than waiting out a drain.
+#[test]
+fn an_over_large_drain_grace_is_clamped() {
+    let (mut child, _port, log) = start_logged(&[("DEN_EMBED_DRAIN_GRACE_SEC", "600")]);
+    signal(&child, SIGTERM);
+    let status = wait_within(&mut child, Duration::from_secs(20)).expect("never exited");
+    assert_eq!(status.code(), Some(0));
+
+    let out = log_after_exit(&log);
+    assert!(
+        out.contains("is outside") && out.contains("using 9"),
+        "600s was accepted as a drain grace; the ceiling is not enforced. Server said:\n{out}"
+    );
+}
+
 /// The grace clock starts at the SIGNAL, not at server start.
 ///
 /// A clock started at boot would deadline INSTANTLY on any service that has been up longer than the
@@ -234,12 +296,17 @@ fn the_grace_clock_starts_at_the_signal_not_at_boot() {
 /// Needs the real model, so it is skipped unless `DEN_EMBED_TEST_MODEL_DIR` points at a directory
 /// holding `model_int8.onnx` + `tokenizer.json`. Skipped rather than faked: nothing smaller than the
 /// real model produces a blocking task long enough to tell the two behaviours apart.
+/// `#[ignore]`, not a silent early return. Returning made CI report `6 passed; 0 ignored` — green,
+/// with the one test guarding the exit-vs-return regression having asserted nothing, and its
+/// explanatory `eprintln!` swallowed without `--nocapture`. An absent test must not be
+/// indistinguishable from a passing one. Run it with:
+///
+///     DEN_EMBED_TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored
 #[test]
+#[ignore = "needs the 555 MB model; set DEN_EMBED_TEST_MODEL_DIR"]
 fn inference_in_flight_does_not_extend_the_stop() {
-    let Ok(model_dir) = std::env::var("DEN_EMBED_TEST_MODEL_DIR") else {
-        eprintln!("skipping: set DEN_EMBED_TEST_MODEL_DIR to a dir with model_int8.onnx + tokenizer.json");
-        return;
-    };
+    let model_dir = std::env::var("DEN_EMBED_TEST_MODEL_DIR")
+        .expect("set DEN_EMBED_TEST_MODEL_DIR to a dir with model_int8.onnx + tokenizer.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_den-embed"))
         .env("DEN_EMBED_PORT", "0")
@@ -344,7 +411,7 @@ fn inference_in_flight_does_not_extend_the_stop() {
     // ...and the deadline is what ended it, which only happens with work still running. Without
     // this, a batch rejected as too large produces the same fast, clean stop and the test passes
     // against the very bug it exists to catch — which is exactly what an earlier version did.
-    let out = log.lock().unwrap().clone();
+    let out = log_after_exit(&log);
     assert!(
         out.contains("drain deadline"),
         "the stop was clean, so no inference was in flight and this proves nothing. Server said:\n{out}"

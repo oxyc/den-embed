@@ -140,10 +140,10 @@ impl Config {
             // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
             max_tokens: env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024),
             // ~0.33s per 512 tokens measured, so 8192 is ~5s — inside the 10s timeout den-atlas
-            // applies to this call. The CEILING has to respect that too: 32768 would be ~21s, double
-            // the caller's timeout, so the clamp would have permitted exactly what the comment said
-            // was out of bounds. 16384 is ~10.5s, the most that can still be waited for.
-            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 16_384),
+            // applies to this call. The CEILING has to respect that too, and strictly: 32768 was
+            // ~21s (double the timeout the comment cited), and 16384 is ~10.5s, still past it.
+            // 12288 is ~7.9s, the largest batch a caller is actually still waiting for.
+            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288),
             max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
             max_body_bytes: env_clamped("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
             // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
@@ -633,11 +633,24 @@ const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
 // operator override, since this assert cannot see one.
 const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
 
-/// The largest grace that can still finish before something outside kills us. The quadlet sets
-/// `--stop-timeout=25`; a grace above it is not a longer drain, it is a SIGKILL mid-drain — the
-/// exact failure this whole mechanism removes. Clamped rather than trusted, because the build-time
-/// assert below only ever guarded the compiled default while the value is settable at runtime.
-const MAX_DRAIN_GRACE: Duration = Duration::from_secs(25);
+/// The largest grace that can still finish before something outside kills us.
+///
+/// Sized against podman's DEFAULT 10s, not against the quadlet's `--stop-timeout=25`. That line
+/// exists in the repo but is not on the box — `podman inspect den-embed` reports `StopTimeout=10`,
+/// because the unit file has never been re-provisioned. So a grace of 10..=25 was a value this
+/// binary accepted and advertised as safe while being a guaranteed SIGKILL mid-drain: exactly the
+/// failure the whole mechanism removes.
+///
+/// Strictly below, not equal: podman starts its clock at the signal and kills at the timeout, so a
+/// grace equal to it loses by however long the deadline takes to fire. Raising this needs the
+/// container's stop timeout raised FIRST, and this binary has no way to check that — which is why
+/// the conservative number is the one compiled in.
+const MAX_DRAIN_GRACE: Duration = Duration::from_secs(9);
+
+// Both the default and the ceiling must finish before the smallest external stop timeout that can
+// apply. The default had this assert; the ceiling did not, which is how 25 got in.
+const _: () = assert!(MAX_DRAIN_GRACE.as_secs() < 10);
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() <= MAX_DRAIN_GRACE.as_secs());
 
 fn drain_grace() -> Duration {
     let secs = env_clamped(
@@ -695,8 +708,13 @@ async fn serve_until(
             Err(e) => Outcome::Failed(format!("serve error: {e}")),
         },
         _ = async {
-            // The clock starts when the signal ARRIVES, not when the server does.
-            let _ = signalled_rx.await;
+            // The clock starts when the signal ARRIVES, not when the server does — and a DROPPED
+            // sender is not an arrival. `oneshot` resolves `Err` immediately when the sender drops,
+            // which would start the grace at that instant; today the only path that drops it also
+            // completes `serve`, which wins the select, but that is a coincidence to rely on.
+            if signalled_rx.await.is_err() {
+                std::future::pending::<()>().await
+            }
             tokio::time::sleep(grace).await;
         } => Outcome::DeadlineHit(format!("drain deadline ({grace:?}) reached with requests still in flight")),
     }
@@ -721,7 +739,12 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 _ = quietly(signal(SignalKind::interrupt())) => {}
             }
             tracing::warn!("den-embed: second signal — exiting without finishing the drain");
-            std::process::exit(0);
+            // `exit_now`, for the same reason as the deadline path — and this is where the hazard is
+            // MOST likely, because you press ^C again precisely when inference is holding the drain
+            // open. Measured with `process::exit`: 3 of 3 second-signal stops logged a bogus ORT
+            // status naming a random node, against 0 of 2 controls. Fixing one call site and not the
+            // other left the worse one behind.
+            exit_now(0);
         });
     }
 }
@@ -809,12 +832,12 @@ mod tests {
     fn no_env_setting_can_undo_the_request_budget() {
         let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
         // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
-        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 16_384);
+        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288);
         // den-atlas times this call out at 10s. A ceiling that permits more than that is a batch
         // nobody is still waiting for — the earlier 32768 allowed ~21s, double the timeout.
         assert!(
-            worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 11.0,
-            "a legal batch can outlast the caller that made it"
+            worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 10.0,
+            "a legal batch can outlast den-atlas's 10s timeout on this call"
         );
 
         // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
