@@ -47,17 +47,31 @@ fn signal(child: &Child, sig: i32) {
 
 /// Start den-embed on an ephemeral port and wait until it reports the port it bound.
 fn start() -> (Child, u16) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_den-embed"))
-        .env("DEN_EMBED_PORT", "0")
+    start_with(&[])
+}
+
+/// Same, with extra environment. Ambient `DEN_EMBED_*` is cleared: a developer with
+/// `DEN_EMBED_DRAIN_GRACE_SEC` exported would otherwise silently change three tests' timing.
+fn start_with(extra: &[(&str, &str)]) -> (Child, u16) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_den-embed"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("DEN_EMBED_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("DEN_EMBED_PORT", "0")
         .env("DEN_EMBED_HOST", "127.0.0.1")
         // Lazy-load, so no model file is ever opened.
         .env("DEN_EMBED_IDLE_UNLOAD_SEC", "1")
         .env("DEN_EMBED_MODEL_DIR", "/nonexistent-on-purpose")
         // tracing_subscriber::fmt() writes to STDOUT, so that is where the readiness line is.
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the binary must start");
+        .stderr(Stdio::null());
+    // AFTER the defaults, so a caller's override wins rather than being silently replaced.
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("the binary must start");
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
@@ -175,6 +189,39 @@ fn an_in_flight_request_completes_across_a_stop() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// The grace clock starts at the SIGNAL, not at server start.
+///
+/// A clock started at boot would deadline INSTANTLY on any service that has been up longer than the
+/// grace — cutting the drain to zero, which is worse than not having one. The comment in `main.rs`
+/// asserts this property; nothing tested it, and the mutation survived the whole suite.
+#[test]
+fn the_grace_clock_starts_at_the_signal_not_at_boot() {
+    let (mut child, port) = start_with(&[("DEN_EMBED_DRAIN_GRACE_SEC", "2")]);
+
+    // Well past the grace, with no signal sent. The service must still be serving.
+    std::thread::sleep(Duration::from_secs(4));
+    let mut probe = TcpStream::connect(("127.0.0.1", port)).expect("still accepting");
+    probe.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut body = String::new();
+    let mut r = BufReader::new(probe);
+    let mut line = String::new();
+    while r.read_line(&mut line).unwrap_or(0) > 0 {
+        body.push_str(&line);
+        line.clear();
+    }
+    assert!(
+        body.contains("200 OK"),
+        "the service stopped serving during ordinary uptime — the grace clock started at boot"
+    );
+
+    // ...and it still drains normally afterwards.
+    let started = Instant::now();
+    signal(&child, SIGTERM);
+    let status = wait_within(&mut child, Duration::from_secs(20)).expect("never exited");
+    assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    assert_eq!(status.code(), Some(0));
+}
+
 /// The stop must be bounded even with INFERENCE in flight — which is the only case that matters,
 /// and the one every test above misses.
 ///
@@ -202,6 +249,8 @@ fn inference_in_flight_does_not_extend_the_stop() {
         // A SHORT grace, so the deadline fires well before the batch finishes. At the 8s default the
         // batch completed first, the deadline never fired, and the test passed against the bug.
         .env("DEN_EMBED_DRAIN_GRACE_SEC", "2")
+        // ~32000 tokens of genuinely dense work, so the batch is still running well past the grace.
+        .env("DEN_EMBED_MAX_REQUEST_TOKENS", "32768")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -221,18 +270,46 @@ fn inference_in_flight_does_not_extend_the_stop() {
         }
     }
     let port = port.expect("no listening port");
+    // KEEP the server's output. The deadline line is the only reliable evidence that a blocking task
+    // was actually in flight: the batch's own HTTP response cannot say so, because it does not
+    // arrive until inference finishes, which is after the stop. An earlier version asserted on a
+    // flag set by the response and could never have been true.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = log.clone();
     std::thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            sink.lock().unwrap().push_str(&line);
+            line.clear();
         }
     });
 
-    // Big enough that the batch is STILL RUNNING when the deadline fires, or the drain finishes
-    // normally and the deadline path — the one that was broken — is never taken. 512 is the
-    // configured max_batch and measures around 10s warm, comfortably past the 8s grace.
-    let texts: Vec<String> = (0..512)
-        .map(|i| format!("a moderately long search query number {i} about films, with enough words to cost real tokens"))
+    // Sized to the REQUEST BUDGET, not to max_batch. The first version of this sent 512 long texts
+    // and was rejected with 413 in 2ms by the very budget added in the same change — before
+    // spawn_blocking, before any inference — so the deadline branch was never taken and the test
+    // passed against the reverted bug. It asserted nothing.
+    //
+    // Every property of this payload is load-bearing, and each was found by the test failing:
+    //  - CJK, because the budget estimates one token per character and only CJK realizes it. English
+    //    is ~4 chars/token, so an English batch sized to the budget finished in 0.3s.
+    //  - VARIED characters, because a repeated character collapses under BPE into a handful of
+    //    tokens: 480 identical Hangul syllables are not 480 tokens.
+    //  - UNIQUE per text, because identical texts are content-cache hits — 16 identical texts is one
+    //    inference and 15 lookups, which also finished in 0.3s.
+    // At the default 8192-token budget the work tops out around 2.5s, too close to any grace worth
+    // testing, so the run below raises the budget (a supported setting, clamped at 32768).
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let texts: Vec<String> = (0..64)
+        .map(|i| {
+            let body: String = (0..500).map(|_| char::from_u32(0xAC00 + (next() % 11172) as u32).unwrap()).collect();
+            format!("{body}{i}")
+        })
         .collect();
     let body = format!("{{\"texts\":{}}}", serde_json_stub(&texts));
     let addr = format!("127.0.0.1:{port}");
@@ -263,6 +340,15 @@ fn inference_in_flight_does_not_extend_the_stop() {
         "stop took {took:?} against a 2s grace — the blocking task extended it, so the bound is not real"
     );
     assert_eq!(status.code(), Some(0), "exited by signal or with a failure code");
+
+    // ...and the deadline is what ended it, which only happens with work still running. Without
+    // this, a batch rejected as too large produces the same fast, clean stop and the test passes
+    // against the very bug it exists to catch — which is exactly what an earlier version did.
+    let out = log.lock().unwrap().clone();
+    assert!(
+        out.contains("drain deadline"),
+        "the stop was clean, so no inference was in flight and this proves nothing. Server said:\n{out}"
+    );
 }
 
 /// Minimal JSON string-array encoder, so the test needs no serde dependency of its own.

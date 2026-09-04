@@ -545,7 +545,32 @@ async fn main() -> anyhow::Result<()> {
     //
     // It also keeps the second-signal escape alive: that is a spawned task, and dropping the runtime
     // cancelled it exactly during the window an operator would be pressing ^C again.
-    std::process::exit(outcome.exit_code());
+    exit_now(outcome.exit_code());
+}
+
+/// Exit without running `atexit` handlers.
+///
+/// `std::process::exit` calls libc `exit()`, which runs the statically-linked ONNX Runtime's C++
+/// static destructors — while a `Run` may still be executing on a `spawn_blocking` thread. Measured:
+/// in 11 of 12 stops that caught inference, the in-flight Run failed with a bogus internal status
+/// (`GetElementType is not implemented`, naming a different random node each time) logged as an
+/// ERROR indistinguishable from a real inference failure. That is ORT's global state being freed
+/// under a running Run — a use-after-free-shaped race that happened to surface as a status. The same
+/// measurement with `_exit` produced it 0 times in 6.
+///
+/// Nothing here needs an atexit handler: the model is read-only, the cache is in-memory, and stdout
+/// is line-buffered so the log lines are already out. It is flushed anyway, because `_exit` will not.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` terminates the process; it has no preconditions.
+    unsafe { libc_exit(code) }
+}
+
+extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 /// The default drain grace, overridable with `DEN_EMBED_DRAIN_GRACE_SEC`.
@@ -562,15 +587,25 @@ async fn main() -> anyhow::Result<()> {
 const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
 
 // The default must finish before the smallest external stop timeout that can apply — podman's and
-// docker's default 10s, which the quadlet does not override. A test only guards what someone
-// remembers to run; this fails the build.
+// docker's default 10s, which applies whenever the quadlet has not reached the box. A test only
+// guards what someone remembers to run; this fails the build. `MAX_DRAIN_GRACE` is what bounds an
+// operator override, since this assert cannot see one.
 const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
 
+/// The largest grace that can still finish before something outside kills us. The quadlet sets
+/// `--stop-timeout=25`; a grace above it is not a longer drain, it is a SIGKILL mid-drain — the
+/// exact failure this whole mechanism removes. Clamped rather than trusted, because the build-time
+/// assert below only ever guarded the compiled default while the value is settable at runtime.
+const MAX_DRAIN_GRACE: Duration = Duration::from_secs(25);
+
 fn drain_grace() -> Duration {
-    match std::env::var("DEN_EMBED_DRAIN_GRACE_SEC").ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(secs) if secs > 0 => Duration::from_secs(secs),
-        _ => DEFAULT_DRAIN_GRACE,
-    }
+    let secs = env_clamped(
+        "DEN_EMBED_DRAIN_GRACE_SEC",
+        DEFAULT_DRAIN_GRACE.as_secs() as usize,
+        1,
+        MAX_DRAIN_GRACE.as_secs() as usize,
+    );
+    Duration::from_secs(secs as u64)
 }
 
 /// How serving ended. The exit code differs: a drain that ran out of time is expected, a serve

@@ -10,7 +10,12 @@
 #     the Python image did via fastembed's warm-up.
 
 # ---- build: compile the binary (ONNX Runtime is STATICALLY linked) ---------------
-FROM rust:1-bookworm AS build
+# TRIXIE, not bookworm. ONNX Runtime 1.28 (ort rc.13) ships a static archive built against
+# libstdc++ 13+: linking it on bookworm fails with undefined `std::__cxx11::basic_string<wchar_t>
+# ::_M_replace_cold` and friends, because Debian 12 ships GCC 12 and that symbol does not exist
+# there. Confirmed by inspecting the image's own libstdc++. The build and runtime stages must move
+# together — ORT is static, but the binary still links libstdc++ dynamically.
+FROM rust:1-trixie AS build
 WORKDIR /src
 
 # tokenizers' `onig` regex backend builds a C library → needs a C toolchain.
@@ -26,7 +31,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
 # ---- model: fetch the baked artifacts -------------------------------------------
-FROM debian:bookworm-slim AS model
+FROM debian:trixie-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /models
@@ -44,7 +49,7 @@ RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
     && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
 # ---- runtime --------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 WORKDIR /app
 
 # ONNX Runtime's OpenMP runtime dep. No shell tools on the health path.
