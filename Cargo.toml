@@ -26,7 +26,7 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "
 ndarray = "0.16"
 # HuggingFace tokenizers — the SAME Rust crate fastembed wraps, so loading the
 # same tokenizer.json gives byte-identical token ids.
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 serde = { version = "1", features = ["derive"] }
