@@ -635,11 +635,14 @@ const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
 
 /// The largest grace that can still finish before something outside kills us.
 ///
-/// Sized against podman's DEFAULT 10s, not against the quadlet's `--stop-timeout=25`. That line
-/// exists in the repo but is not on the box — `podman inspect den-embed` reports `StopTimeout=10`,
-/// because the unit file has never been re-provisioned. So a grace of 10..=25 was a value this
-/// binary accepted and advertised as safe while being a guaranteed SIGKILL mid-drain: exactly the
-/// failure the whole mechanism removes.
+/// Sized against podman's DEFAULT 10s, not against the quadlet's `--stop-timeout=25`.
+///
+/// The box now does carry that 25s (it did not for most of the time this was written — `podman
+/// inspect` reported 10 while the repo said 25, and a grace of 10..=25 was therefore a value this
+/// binary accepted and advertised as safe while being a guaranteed SIGKILL mid-drain). It stays
+/// sized to the default anyway: this binary also runs under plain `docker run`, under compose, and
+/// on any box provisioned before that line landed, and it cannot see which. A ceiling that is
+/// correct everywhere beats one that is correct where someone remembered to re-provision.
 ///
 /// Strictly below, not equal: podman starts its clock at the signal and kills at the timeout, so a
 /// grace equal to it loses by however long the deadline takes to fire. Raising this needs the
