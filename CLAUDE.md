@@ -44,15 +44,16 @@ exist to prevent.
 
 **Truncation is silent, and that matters for one caller.** `den-dataset/scripts/embed-corpus-run.sh`
 builds the CORPUS. It now runs this service's published container (it used to boot `uvicorn
-server:app`, deleted in the Rust rewrite), and pointing it here was indeed the trap this section
-warned about: documents are cut at 512 tokens with nothing logged and nothing in the response saying
-so, while the corpus shipping today was embedded by the Python service with no token cap at all.
+server:app`, deleted in the Rust rewrite). Truncation is still silent — documents are cut at
+`max_tokens` with nothing logged and nothing in the response saying so — so den-dataset refuses up
+front when its plot cap would not fit (`assertDocFits`) rather than letting this service quietly
+halve a document.
 
-Parity is not reachable by raising the cap — the ceiling is 1024 tokens because peak RSS is 1219 MB
-there against a 1536 MB limit. So den-dataset lowered its `--plot-cap` to fit instead, and
-`embed-corpus` REFUSES when the composed document would not (`assertDocFits`), rather than letting
-this service quietly halve it. A re-embed therefore changes the corpus; that is a decision, and the
-alignment that matters still holds because queries pass through this same service.
+It does NOT follow that a re-embed shortens the corpus. The shipped corpus was built by `assemble`,
+whose plot cap has always been 1500; that plus facts is ~450 tokens, inside the 512 default. An
+earlier version of this section claimed the corpus used ~4000 chars — that was a different command's
+default for a different out-dir, and it was wrong. The real corpus-versus-query risk here is the
+runtime, which is what `vector_epoch` exists to record.
 
 `DEN_EMBED_MAX_BATCH` is NOT a server-side micro-batch — `embed_many` maps `embed_one` serially, so
 it bounds no memory at all. It is purely a rejection threshold (413 above it). Setting it low while
