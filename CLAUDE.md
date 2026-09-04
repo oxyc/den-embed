@@ -49,11 +49,19 @@ server:app`, deleted in the Rust rewrite). Truncation is still silent — docume
 front when its plot cap would not fit (`assertDocFits`) rather than letting this service quietly
 halve a document.
 
-It does NOT follow that a re-embed shortens the corpus. The shipped corpus was built by `assemble`,
-whose plot cap has always been 1500; that plus facts is ~450 tokens, inside the 512 default. An
-earlier version of this section claimed the corpus used ~4000 chars — that was a different command's
-default for a different out-dir, and it was wrong. The real corpus-versus-query risk here is the
-runtime, which is what `vector_epoch` exists to record.
+**A re-embed DOES shorten the corpus, substantially.** The shipped corpus was built by `assemble` on
+2026-07-05, five weeks before the Rust rewrite, against the Python service — which had NO token cap
+at all, only `MAX_CHARS` (8000 by default, so ~0.8% of titles truncated). Plot capping did not exist
+in den-dataset until four hours after that run. So the documents are whole plots: median 2,740 chars
+(~685 tokens), p95 5,054 (~1,264).
+
+Re-embedding through this service at the 512-token default shortens **65.3% of documents** and keeps
+**45.9%** of the plot text — the median document does not fit, so this is half the corpus, not a tail.
+
+Two earlier versions of this paragraph were wrong in both directions (first "~4000 chars", then
+"always 1500, so a re-embed is neutral"). Neither described the shipped artifact. If you are about to
+restate this, verify it against `dataset.meta.json`'s builtAt versus den-dataset commit 8f93235
+rather than against whatever the defaults say today.
 
 `DEN_EMBED_MAX_BATCH` is NOT a server-side micro-batch — `embed_many` maps `embed_one` serially, so
 it bounds no memory at all. It is purely a rejection threshold (413 above it). Setting it low while
