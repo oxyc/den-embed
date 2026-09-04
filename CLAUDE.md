@@ -1,10 +1,23 @@
 # CLAUDE.md — den-embed
 
 bge-m3 int8 embedding service for den-atlas's semantic search. **Rust** (axum + `ort`/ONNX Runtime +
-HuggingFace `tokenizers`) — a rewrite of the former Python/fastembed service, byte-identical in output
-(same tokenizer.json + same model_int8.onnx on the same ONNX Runtime; see `tests/parity_check.py`) but
-with a far smaller idle footprint. The model is **baked into the image** at build time (no runtime
-download → no boot-time crash-loop). Runs as a rootful-podman **Quadlet** container in the `den` stack
+HuggingFace `tokenizers`) — a rewrite of the former Python/fastembed service with a far smaller idle
+footprint.
+
+**Byte-parity with the Python service ended at ONNX Runtime 1.28** (ort rc.13; rc.10 pinned 1.22).
+Same tokenizer.json and same model_int8.onnx, but the native engine's int8 kernels changed: measured
+over 20 texts, every one differs — about half the 1024 dims move, by at most 3/127. What that costs
+retrieval was measured too, and it is very little: cosine(old, new) for the same text is 0.976-0.987,
+while two DIFFERENT texts sit at 0.23-0.67, so the drift is an order of magnitude smaller than the
+gap it would have to cross. Zero nearest-neighbour flips over that set.
+
+The consequence to keep in mind: this service embeds the QUERY, and the corpus vectors come from
+den-dataset. They should be built on the same runtime. If search quality ever looks subtly wrong
+after a runtime bump on one side only, this is the first thing to check. `tests/parity_check.py`
+still works, but its golden set is now a record of 1.22, not a gate.
+
+The model is **baked into the image** at build time (no runtime download → no boot-time crash-loop).
+Runs as a rootful-podman **Quadlet** container in the `den` stack
 on the homelab box (`den/deploy/quadlet/den-embed.container`), reached by atlas at `http://den-embed:8080`.
 
 ## Releasing — READ THIS: code on `main` ≠ running on the box
@@ -47,7 +60,7 @@ isn't re-explored:
 
 | option | verdict |
 |---|---|
-| **int8 + ORT (this)** | baseline — idle 43 MB, warm 1.2 GB, image 690 MB, cold 1.3 s, byte-parity |
+| **int8 + ORT (this)** | baseline — idle 43 MB, warm 1.2 GB, image 690 MB, cold 1.3 s |
 | fp16 (ORT or Candle) | **only quality-positive: +1.5% nDCG / +4% MRR** (measured, plotless corpus) — but needs a full corpus re-embed, ~2× model/warm, slower cold. Quality-only play, not footprint. |
 | q4 GGUF | **worse** than int8 (−8% nDCG). Dead. |
 | smaller model (e5-small) | **worse** (−12.5% nDCG), only faster. Dead. |

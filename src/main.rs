@@ -36,7 +36,11 @@ const DIMS: usize = 1024;
 
 /// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
 /// into `anyhow::Error` directly; map it through its Display.
-fn ort_err(e: ort::Error) -> anyhow::Error {
+///
+/// Generic over the recovery payload: from ort rc.13 the session-builder methods fail with
+/// `Error<SessionBuilder>`, which hands the builder back so a caller could retry, while everything
+/// else still fails with `Error<()>`. We do not retry, so both collapse to the same message.
+fn ort_err<R>(e: ort::Error<R>) -> anyhow::Error {
     anyhow::anyhow!("ort: {e}")
 }
 
@@ -415,7 +419,12 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
-    ort::init().with_name("den-embed").commit().map_err(ort_err)?;
+    // rc.13 returns bool, not Result: false means an environment was already committed, so this
+    // config simply does not take effect. Nothing else in the process commits one, and there is no
+    // failure to report — but say so rather than discard it silently.
+    if !ort::init().with_name("den-embed").commit() {
+        tracing::warn!("ort environment was already committed; den-embed's configuration is not in effect");
+    }
 
     let cfg = Config::from_env();
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -448,9 +457,135 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("den-embed listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    // Registered BEFORE the readiness line, so nothing is told the service is up while a stop signal
+    // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
+    let shutdown = shutdown_signal();
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    tracing::info!("den-embed listening on http://{addr} (port {bound})");
+
+    let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
+    match &outcome {
+        Outcome::Drained => tracing::info!("den-embed: shut down cleanly"),
+        Outcome::DeadlineHit(why) => tracing::warn!("den-embed: {why}"),
+        Outcome::Failed(why) => tracing::error!("den-embed: {why}"),
+    }
+    let code = outcome.exit_code();
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
+}
+
+/// How long in-flight requests get to finish after a stop signal.
+///
+/// The binary is PID 1 in its container (`ENTRYPOINT` exec form), and PID 1 gets no default
+/// terminate action — so without a handler SIGTERM was ignored entirely and podman waited its full
+/// stop timeout before SIGKILLing: a guaranteed ~10s of downtime on every deploy and auto-update,
+/// with every in-flight embed cut. Under podman's DEFAULT 10s, because the quadlet sets no
+/// stop-timeout of its own; an embed is milliseconds warm and ~1.3s cold, so this is generous.
+const DRAIN_GRACE: Duration = Duration::from_secs(8);
+const _: () = assert!(DRAIN_GRACE.as_secs() < 10);
+
+/// How serving ended. The exit code differs: a drain that ran out of time is expected, a serve
+/// error is not.
+#[derive(Debug)]
+enum Outcome {
+    Drained,
+    DeadlineHit(String),
+    Failed(String),
+}
+
+impl Outcome {
+    /// A drain that ran out of time is a DESIGNED outcome, so it exits 0. Exiting non-zero would put
+    /// the unit into `failed` with Result=exit-code on a routine restart.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Outcome::Drained | Outcome::DeadlineHit(_) => 0,
+            Outcome::Failed(_) => 1,
+        }
+    }
+}
+
+/// Serve until `shutdown` resolves, then drain for at most `grace`.
+///
+/// The bound is the point. `with_graceful_shutdown` waits for every connection task and hyper waits
+/// on one that is mid-request, and there is no header-read timeout anywhere — so a client that opens
+/// a socket and sends half a request head would hold the process open indefinitely, making restart
+/// downtime a function of what an arbitrary client does with a TCP socket.
+///
+/// `shutdown` is a parameter rather than a direct call so a test can trigger the drain without
+/// signalling the test runner itself.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Outcome {
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = signalled_tx.send(());
+    });
+    tokio::select! {
+        r = serve => match r {
+            Ok(()) => Outcome::Drained,
+            Err(e) => Outcome::Failed(format!("serve error: {e}")),
+        },
+        _ = async {
+            // The clock starts when the signal ARRIVES, not when the server does.
+            let _ = signalled_rx.await;
+            tokio::time::sleep(grace).await;
+        } => Outcome::DeadlineHit(format!("drain deadline ({grace:?}) reached with requests still in flight")),
+    }
+}
+
+/// Resolves when the process is asked to stop. Handlers are registered eagerly, by the caller.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
+        tokio::select! {
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
+        }
+        // A SECOND signal ends it now. Both handles are dropped by here and tokio does not restore
+        // the default disposition when a `Signal` drops, so without re-registering every later
+        // SIGTERM and ^C would be caught and discarded and only SIGKILL would work.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            tracing::warn!("den-embed: second signal — exiting without finishing the drain");
+            std::process::exit(0);
+        });
+    }
+}
+
+/// Resolve when this signal arrives, or NEVER if it could not be registered — resolving immediately
+/// would shut the server down the moment it started, which is worse than the hard kill it replaces.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            tracing::info!("den-embed: {name} — draining in-flight requests");
+        }
+        Err(e) => {
+            tracing::error!("den-embed: {name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+/// Like `wait_for`, but silent — the caller prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
 }
 
 #[cfg(test)]
