@@ -33,6 +33,25 @@ The model is **baked into the image** at build time (no runtime download → no 
 Runs as a rootful-podman **Quadlet** container in the `den` stack
 on the homelab box (`den/deploy/quadlet/den-embed.container`), reached by atlas at `http://den-embed:8080`.
 
+## Limits: this service is sized for QUERIES, not documents
+
+`DEN_EMBED_MAX_TOKENS` (512) caps each text, and `DEN_EMBED_MAX_REQUEST_TOKENS` (8192) caps a whole
+request. Both are memory/latency bounds with measurements behind them, not guesses: peak RSS is
+1219 MB at 1024 tokens and 1598 MB at 2048 against a 1536 MB cgroup, and inference runs ~0.33 s per
+512 tokens while holding the model lock, so 8192 tokens is ~5 s — inside the 10 s timeout den-atlas
+puts on this call. Both are clamped, so no env value can raise them back into the failures they
+exist to prevent.
+
+**Truncation is silent, and that matters for one caller.** `den-dataset/scripts/embed-corpus-run.sh`
+builds the CORPUS by booting an embed service with `DEN_EMBED_MAX_CHARS=5000` and feeding it
+documents. It currently boots `uvicorn server:app` — the Python service, which no longer exists in
+this repo — so it is already broken; the trap is that pointing it at the Rust service looks like the
+obvious fix. Documents would then be cut to 512 tokens with nothing logged and nothing in the
+response saying so, while the existing corpus was embedded at up to ~5000. If you need to embed
+documents, raise `DEN_EMBED_MAX_TOKENS` deliberately (and check the memory numbers above first) —
+do not let the default apply by accident. Note also that `DEN_EMBED_BATCH`, which that script sets,
+is not read by this service at all.
+
 ## Releasing — READ THIS: code on `main` ≠ running on the box
 
 The `image` job in `.github/workflows/ci.yml` builds + pushes `ghcr.io/oxyc/den-embed` **only on a

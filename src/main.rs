@@ -71,12 +71,16 @@ struct Config {
     ///
     /// 512 because this service embeds SEARCH QUERIES; anything near the cap is already not a query.
     max_tokens: usize,
-    /// Total characters across ONE request, batch included. Per-text limits bound nothing in
-    /// aggregate: `max_batch` (512) x `max_chars` (8000) is 4M characters, and `embed_many` is a
-    /// serial loop holding the model lock, so one 4 MB batch of CJK pinned the whole service for a
-    /// measured ~20-30 minutes with every other request queued behind it. Worst case is roughly one
-    /// token per character, so this is also the request's token budget.
-    max_request_chars: usize,
+    /// Total TOKENS across one request, batch included — the thing that actually costs time. Per-text
+    /// limits bound nothing in aggregate: `max_batch` (512) x `max_chars` (8000) is 4M characters
+    /// through a serial loop holding the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Counted as `min(chars, max_tokens)` per text, which is an upper bound on what inference will
+    /// actually see: a text yields at most one token per character, and truncation caps it at
+    /// `max_tokens` regardless. Counting raw characters instead got this backwards in both
+    /// directions — it rejected three 8000-char English texts (1536 tokens, about a second of work)
+    /// while admitting 32 texts of 512 CJK characters (16384 tokens, ~10 seconds).
+    max_request_tokens: usize,
     max_batch: usize,
     max_body_bytes: usize,
     cache_max: usize,
@@ -84,12 +88,32 @@ struct Config {
     intra_threads: usize,
 }
 
-fn env_usize(key: &str, default: usize, min: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.max(min))
-        .unwrap_or(default)
+/// Read a numeric env var, clamped to `[min, max]`.
+///
+/// A malformed value is REPORTED, not silently replaced: `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed
+/// as nothing and fell back to 0, which means always-warm — ~1 GB resident forever, the exact
+/// opposite of what the operator asked for, with no line anywhere saying so. That value lives in
+/// /etc/den/env on the box, outside this repo, so nothing reviews it either.
+///
+/// `max` matters as much as `min`: several of these bound memory, and an out-of-range value silently
+/// restores the failure the bound exists to prevent (`DEN_EMBED_MAX_TOKENS=8192` is the OOM again).
+fn env_clamped(key: &str, default: usize, min: usize, max: usize) -> usize {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => {
+                let clamped = v.clamp(min, max);
+                if clamped != v {
+                    tracing::warn!("{key}={v} is outside {min}..={max}; using {clamped}");
+                }
+                clamped
+            }
+            Err(_) => {
+                tracing::warn!("{key}={raw:?} is not a number; using the default {default}");
+                default
+            }
+        },
+    }
 }
 
 impl Config {
@@ -101,7 +125,8 @@ impl Config {
             .unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
         let tokenizer_path = std::env::var("DEN_EMBED_TOKENIZER")
             .unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
-        let idle = env_usize("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0);
+        // A day is already far past "idle"; anything larger is a typo.
+        let idle = env_clamped("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0, 86_400);
         Self {
             host: std::env::var("DEN_EMBED_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
             port: std::env::var("DEN_EMBED_PORT")
@@ -110,15 +135,20 @@ impl Config {
                 .unwrap_or(8080),
             onnx_path,
             tokenizer_path,
-            max_chars: env_usize("DEN_EMBED_MAX_CHARS", 8000, 500),
-            max_tokens: env_usize("DEN_EMBED_MAX_TOKENS", 512, 16),
-            max_request_chars: env_usize("DEN_EMBED_MAX_REQUEST_CHARS", 16_384, 500),
-            max_batch: env_usize("DEN_EMBED_MAX_BATCH", 512, 1),
-            max_body_bytes: env_usize("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024),
-            cache_max: env_usize("DEN_EMBED_CACHE_MAX", 8192, 0),
+            max_chars: env_clamped("DEN_EMBED_MAX_CHARS", 8000, 500, 100_000),
+            // 1024 is the ceiling, not the model's: measured peak RSS is 1219 MB at 1024 tokens and
+            // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
+            max_tokens: env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024),
+            // ~0.33s per 512 tokens measured, so 8192 is ~5s of held model lock — inside the 10s
+            // timeout den-atlas applies to this call. 32768 would exceed it.
+            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 32_768),
+            max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
+            max_body_bytes: env_clamped("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+            // Each entry is ~4.2 KB, so this is the cache's memory bound too: 65536 is ~275 MB.
+            cache_max: env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 65_536),
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
-            intra_threads: env_usize("DEN_EMBED_INTRA_THREADS", 0, 0),
+            intra_threads: env_clamped("DEN_EMBED_INTRA_THREADS", 0, 0, 256),
         }
     }
 }
@@ -401,17 +431,22 @@ async fn embed_batch(
         ));
     }
     // Bound the TOTAL work, not just the count. Each text is separately capped, but `embed_many` is
-    // a serial loop holding the model lock, so the product is what decides how long every other
-    // request waits — and 512 x 8000 chars of CJK measured at ~20-30 minutes of held lock.
-    let total: usize = body.texts.iter().map(|t| t.chars().count()).sum();
-    if total > state.cfg.max_request_chars {
+    // a serial loop holding the model lock, so the aggregate is what decides how long every other
+    // request waits — 512 x 8000 chars of CJK measured at ~20-30 minutes of held lock.
+    //
+    // In TOKENS, not characters: `min(chars, max_tokens)` is an upper bound on what inference sees,
+    // since a text yields at most one token per character and truncation caps it anyway. Counting
+    // characters was wrong in both directions — it rejected 3 x 8000 English characters (1536
+    // tokens, ~1s) while admitting 32 x 512 CJK characters (16384 tokens, ~10s).
+    let total: usize = body.texts.iter().map(|t| t.chars().count().min(state.cfg.max_tokens)).sum();
+    if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrResp {
                 detail: format!(
-                    "batch too large: {total} characters across {} texts (max {} in total)",
+                    "batch too large: ~{total} tokens across {} texts (max {} in total)",
                     body.texts.len(),
-                    state.cfg.max_request_chars
+                    state.cfg.max_request_tokens
                 ),
             }),
         ));
@@ -689,19 +724,41 @@ mod tests {
 
     /// Per-text limits bound nothing in aggregate: max_batch x max_chars is 4M characters through a
     /// serial loop that holds the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Asserted on the CLAMPS rather than on `Config::from_env()`, because from_env with no
+    /// environment set only ever reports the compiled-in defaults — a test that reads like a runtime
+    /// guard and is really just documentation. These check that no OPERATOR setting can undo the
+    /// bound, which is the part that matters.
     #[test]
-    fn a_request_budget_bounds_the_total_not_just_each_text() {
-        let cfg = Config::from_env();
-        assert!(
-            cfg.max_request_chars < cfg.max_batch * cfg.max_chars,
-            "the request budget ({}) does not bound the batch product ({} x {})",
-            cfg.max_request_chars,
-            cfg.max_batch,
-            cfg.max_chars
-        );
-        // Worst case is roughly one token per character, so this is also the token budget. Keep it
-        // to something that finishes in tens of seconds at the measured ~700 tokens/s.
-        assert!(cfg.max_request_chars <= 32_768, "budget {} is too long to hold the lock", cfg.max_request_chars);
+    fn no_env_setting_can_undo_the_request_budget() {
+        let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
+        // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
+        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 32_768);
+        assert!(ceiling <= 32_768);
+        assert!(worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 25.0, "a legal batch can outlast any caller");
+
+        // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
+        // at 2048, against a 1536 MB cgroup.
+        std::env::set_var("DEN_EMBED_MAX_TOKENS", "8192");
+        let raised = env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024);
+        std::env::remove_var("DEN_EMBED_MAX_TOKENS");
+        assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
+    }
+
+    /// A malformed value must not silently become the opposite of what was asked for.
+    /// `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed as nothing and fell back to 0 — always-warm, ~1 GB
+    /// resident forever — with no line anywhere saying so.
+    #[test]
+    fn a_malformed_setting_falls_back_to_the_default_not_to_zero() {
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "600s");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "-5");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", " 42 ");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 42, "a padded number is still a number");
+        std::env::remove_var("DEN_EMBED_TEST_MALFORMED");
     }
 
     #[test]
