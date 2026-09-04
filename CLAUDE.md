@@ -43,14 +43,26 @@ puts on this call. Both are clamped, so no env value can raise them back into th
 exist to prevent.
 
 **Truncation is silent, and that matters for one caller.** `den-dataset/scripts/embed-corpus-run.sh`
-builds the CORPUS by booting an embed service with `DEN_EMBED_MAX_CHARS=5000` and feeding it
-documents. It currently boots `uvicorn server:app` — the Python service, which no longer exists in
-this repo — so it is already broken; the trap is that pointing it at the Rust service looks like the
-obvious fix. Documents would then be cut to 512 tokens with nothing logged and nothing in the
-response saying so, while the existing corpus was embedded at up to ~5000. If you need to embed
-documents, raise `DEN_EMBED_MAX_TOKENS` deliberately (and check the memory numbers above first) —
-do not let the default apply by accident. Note also that `DEN_EMBED_BATCH`, which that script sets,
-is not read by this service at all.
+builds the CORPUS. It now runs this service's published container (it used to boot `uvicorn
+server:app`, deleted in the Rust rewrite), and pointing it here was indeed the trap this section
+warned about: documents are cut at 512 tokens with nothing logged and nothing in the response saying
+so, while the corpus shipping today was embedded by the Python service with no token cap at all.
+
+Parity is not reachable by raising the cap — the ceiling is 1024 tokens because peak RSS is 1219 MB
+there against a 1536 MB limit. So den-dataset lowered its `--plot-cap` to fit instead, and
+`embed-corpus` REFUSES when the composed document would not (`assertDocFits`), rather than letting
+this service quietly halve it. A re-embed therefore changes the corpus; that is a decision, and the
+alignment that matters still holds because queries pass through this same service.
+
+`DEN_EMBED_MAX_BATCH` is NOT a server-side micro-batch — `embed_many` maps `embed_one` serially, so
+it bounds no memory at all. It is purely a rejection threshold (413 above it). Setting it low while
+sending larger requests is how that script was briefly unable to embed a single title.
+
+**`vector_epoch` identifies the vectors; the crate version does not.** den-dataset records the
+embedder identity with each corpus and refuses to append a different one, so if the version were the
+identity, a release changing only a log line would invalidate 37.5k titles. Bump `VECTOR_EPOCH` when
+— and only when — output moves for the same input: an ONNX Runtime upgrade, a model or revision
+change, a pooling or normalisation change.
 
 ## Releasing — READ THIS: code on `main` ≠ running on the box
 
