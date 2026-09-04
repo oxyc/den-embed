@@ -63,6 +63,20 @@ struct Config {
     onnx_path: String,
     tokenizer_path: String,
     max_chars: usize,
+    /// Per-text TOKEN cap. `max_chars` bounds characters, which bounds nothing that matters: at the
+    /// 8000-char limit, emoji tokenize to 8003 tokens and Hangul to 8002, so a small request reached
+    /// the model's full 8192-token ceiling. Activation memory grows superlinearly with sequence
+    /// length — measured peak RSS 1087 MB at 512 tokens, 1219 MB at 1024, 1598 MB at 2048 — against
+    /// a 1536 MB cgroup limit, so a ~10 KB POST body was an OOM-kill of the container.
+    ///
+    /// 512 because this service embeds SEARCH QUERIES; anything near the cap is already not a query.
+    max_tokens: usize,
+    /// Total characters across ONE request, batch included. Per-text limits bound nothing in
+    /// aggregate: `max_batch` (512) x `max_chars` (8000) is 4M characters, and `embed_many` is a
+    /// serial loop holding the model lock, so one 4 MB batch of CJK pinned the whole service for a
+    /// measured ~20-30 minutes with every other request queued behind it. Worst case is roughly one
+    /// token per character, so this is also the request's token budget.
+    max_request_chars: usize,
     max_batch: usize,
     max_body_bytes: usize,
     cache_max: usize,
@@ -97,6 +111,8 @@ impl Config {
             onnx_path,
             tokenizer_path,
             max_chars: env_usize("DEN_EMBED_MAX_CHARS", 8000, 500),
+            max_tokens: env_usize("DEN_EMBED_MAX_TOKENS", 512, 16),
+            max_request_chars: env_usize("DEN_EMBED_MAX_REQUEST_CHARS", 16_384, 500),
             max_batch: env_usize("DEN_EMBED_MAX_BATCH", 512, 1),
             max_body_bytes: env_usize("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024),
             cache_max: env_usize("DEN_EMBED_CACHE_MAX", 8192, 0),
@@ -125,11 +141,11 @@ impl Model {
         let session = builder.commit_from_file(&cfg.onnx_path).map_err(ort_err)?;
         let mut tokenizer =
             Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        // bge-m3 supports 8192 tokens; the tokenizer.json ships no truncation, so
-        // set it explicitly (matches fastembed capping at the model max). Our texts
-        // are pre-truncated to max_chars, so this is only a safety cap for CJK.
+        // bge-m3 supports 8192 tokens, but the ceiling that matters here is memory, not the model:
+        // see `Config::max_tokens`. The tokenizer.json ships no truncation, so this is where the cap
+        // is actually enforced — `max_chars` does not bound tokens for non-Latin text.
         let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-            max_length: 8192,
+            max_length: cfg.max_tokens,
             ..Default::default()
         }));
         Ok(Self { session, tokenizer })
@@ -384,6 +400,22 @@ async fn embed_batch(
             }),
         ));
     }
+    // Bound the TOTAL work, not just the count. Each text is separately capped, but `embed_many` is
+    // a serial loop holding the model lock, so the product is what decides how long every other
+    // request waits — and 512 x 8000 chars of CJK measured at ~20-30 minutes of held lock.
+    let total: usize = body.texts.iter().map(|t| t.chars().count()).sum();
+    if total > state.cfg.max_request_chars {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrResp {
+                detail: format!(
+                    "batch too large: {total} characters across {} texts (max {} in total)",
+                    body.texts.len(),
+                    state.cfg.max_request_chars
+                ),
+            }),
+        ));
+    }
     let vectors =
         tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
             .await
@@ -463,28 +495,48 @@ async fn main() -> anyhow::Result<()> {
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     tracing::info!("den-embed listening on http://{addr} (port {bound})");
 
-    let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
+    let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
     match &outcome {
         Outcome::Drained => tracing::info!("den-embed: shut down cleanly"),
         Outcome::DeadlineHit(why) => tracing::warn!("den-embed: {why}"),
         Outcome::Failed(why) => tracing::error!("den-embed: {why}"),
     }
-    let code = outcome.exit_code();
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    // EXIT, rather than returning. Returning drops the tokio runtime, and dropping a runtime blocks
+    // until every in-flight `spawn_blocking` finishes — which is where all inference runs. So the
+    // deadline bounded the drain and then the process sat waiting on the very task it had just given
+    // up on: measured 8s deadline, 14.4s actual exit, straight through podman's 10s stop timeout
+    // into a SIGKILL, with the response lost anyway. The whole point of the bound is that the stop
+    // takes a knowable length of time, and only exiting here delivers that.
+    //
+    // It also keeps the second-signal escape alive: that is a spawned task, and dropping the runtime
+    // cancelled it exactly during the window an operator would be pressing ^C again.
+    std::process::exit(outcome.exit_code());
 }
 
-/// How long in-flight requests get to finish after a stop signal.
+/// The default drain grace, overridable with `DEN_EMBED_DRAIN_GRACE_SEC`.
+///
+/// Configurable because it is coupled to the container's stop timeout, which is set outside this
+/// binary: raise one and you must raise the other. The default is what is safe with no stop timeout
+/// configured at all, which is how the quadlet currently runs.
 ///
 /// The binary is PID 1 in its container (`ENTRYPOINT` exec form), and PID 1 gets no default
 /// terminate action — so without a handler SIGTERM was ignored entirely and podman waited its full
 /// stop timeout before SIGKILLing: a guaranteed ~10s of downtime on every deploy and auto-update,
 /// with every in-flight embed cut. Under podman's DEFAULT 10s, because the quadlet sets no
 /// stop-timeout of its own; an embed is milliseconds warm and ~1.3s cold, so this is generous.
-const DRAIN_GRACE: Duration = Duration::from_secs(8);
-const _: () = assert!(DRAIN_GRACE.as_secs() < 10);
+const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+// The default must finish before the smallest external stop timeout that can apply — podman's and
+// docker's default 10s, which the quadlet does not override. A test only guards what someone
+// remembers to run; this fails the build.
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
+
+fn drain_grace() -> Duration {
+    match std::env::var("DEN_EMBED_DRAIN_GRACE_SEC").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => DEFAULT_DRAIN_GRACE,
+    }
+}
 
 /// How serving ended. The exit code differs: a drain that ran out of time is expected, a serve
 /// error is not.
@@ -623,6 +675,33 @@ mod tests {
         assert!(is_blank(""));
         assert!(is_blank("   "));
         assert!(!is_blank("hola"));
+    }
+
+    /// The token cap is what bounds activation memory, and `max_chars` does not imply it: at the
+    /// 8000-char limit, Hangul and emoji tokenize to ~8000 tokens, and peak RSS measured 1598 MB at
+    /// 2048 tokens against a 1536 MB cgroup — a ~10 KB request was an OOM-kill.
+    #[test]
+    fn the_token_cap_is_below_what_the_memory_limit_allows() {
+        let cfg = Config::from_env();
+        assert!(cfg.max_tokens <= 1024, "max_tokens {} exceeds what 1536 MB can hold", cfg.max_tokens);
+        assert!(cfg.max_tokens >= 16, "max_tokens {} is too small to embed a query", cfg.max_tokens);
+    }
+
+    /// Per-text limits bound nothing in aggregate: max_batch x max_chars is 4M characters through a
+    /// serial loop that holds the model lock, measured at ~20-30 minutes of pinned service.
+    #[test]
+    fn a_request_budget_bounds_the_total_not_just_each_text() {
+        let cfg = Config::from_env();
+        assert!(
+            cfg.max_request_chars < cfg.max_batch * cfg.max_chars,
+            "the request budget ({}) does not bound the batch product ({} x {})",
+            cfg.max_request_chars,
+            cfg.max_batch,
+            cfg.max_chars
+        );
+        // Worst case is roughly one token per character, so this is also the token budget. Keep it
+        // to something that finishes in tens of seconds at the measured ~700 tokens/s.
+        assert!(cfg.max_request_chars <= 32_768, "budget {} is too long to hold the lock", cfg.max_request_chars);
     }
 
     #[test]
