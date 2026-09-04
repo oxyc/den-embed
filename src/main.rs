@@ -36,7 +36,11 @@ const DIMS: usize = 1024;
 
 /// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
 /// into `anyhow::Error` directly; map it through its Display.
-fn ort_err(e: ort::Error) -> anyhow::Error {
+///
+/// Generic over the recovery payload: from ort rc.13 the session-builder methods fail with
+/// `Error<SessionBuilder>`, which hands the builder back so a caller could retry, while everything
+/// else still fails with `Error<()>`. We do not retry, so both collapse to the same message.
+fn ort_err<R>(e: ort::Error<R>) -> anyhow::Error {
     anyhow::anyhow!("ort: {e}")
 }
 
@@ -59,6 +63,24 @@ struct Config {
     onnx_path: String,
     tokenizer_path: String,
     max_chars: usize,
+    /// Per-text TOKEN cap. `max_chars` bounds characters, which bounds nothing that matters: at the
+    /// 8000-char limit, emoji tokenize to 8003 tokens and Hangul to 8002, so a small request reached
+    /// the model's full 8192-token ceiling. Activation memory grows superlinearly with sequence
+    /// length — measured peak RSS 1087 MB at 512 tokens, 1219 MB at 1024, 1598 MB at 2048 — against
+    /// a 1536 MB cgroup limit, so a ~10 KB POST body was an OOM-kill of the container.
+    ///
+    /// 512 because this service embeds SEARCH QUERIES; anything near the cap is already not a query.
+    max_tokens: usize,
+    /// Total TOKENS across one request, batch included — the thing that actually costs time. Per-text
+    /// limits bound nothing in aggregate: `max_batch` (512) x `max_chars` (8000) is 4M characters
+    /// through a serial loop holding the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Counted as `min(chars, max_tokens)` per text, which is an upper bound on what inference will
+    /// actually see: a text yields at most one token per character, and truncation caps it at
+    /// `max_tokens` regardless. Counting raw characters instead got this backwards in both
+    /// directions — it rejected three 8000-char English texts (1536 tokens, about a second of work)
+    /// while admitting 32 texts of 512 CJK characters (16384 tokens, ~10 seconds).
+    max_request_tokens: usize,
     max_batch: usize,
     max_body_bytes: usize,
     cache_max: usize,
@@ -66,12 +88,32 @@ struct Config {
     intra_threads: usize,
 }
 
-fn env_usize(key: &str, default: usize, min: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.max(min))
-        .unwrap_or(default)
+/// Read a numeric env var, clamped to `[min, max]`.
+///
+/// A malformed value is REPORTED, not silently replaced: `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed
+/// as nothing and fell back to 0, which means always-warm — ~1 GB resident forever, the exact
+/// opposite of what the operator asked for, with no line anywhere saying so. That value lives in
+/// /etc/den/env on the box, outside this repo, so nothing reviews it either.
+///
+/// `max` matters as much as `min`: several of these bound memory, and an out-of-range value silently
+/// restores the failure the bound exists to prevent (`DEN_EMBED_MAX_TOKENS=8192` is the OOM again).
+fn env_clamped(key: &str, default: usize, min: usize, max: usize) -> usize {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => {
+                let clamped = v.clamp(min, max);
+                if clamped != v {
+                    tracing::warn!("{key}={v} is outside {min}..={max}; using {clamped}");
+                }
+                clamped
+            }
+            Err(_) => {
+                tracing::warn!("{key}={raw:?} is not a number; using the default {default}");
+                default
+            }
+        },
+    }
 }
 
 impl Config {
@@ -83,7 +125,8 @@ impl Config {
             .unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
         let tokenizer_path = std::env::var("DEN_EMBED_TOKENIZER")
             .unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
-        let idle = env_usize("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0);
+        // A day is already far past "idle"; anything larger is a typo.
+        let idle = env_clamped("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0, 86_400);
         Self {
             host: std::env::var("DEN_EMBED_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
             port: std::env::var("DEN_EMBED_PORT")
@@ -92,13 +135,25 @@ impl Config {
                 .unwrap_or(8080),
             onnx_path,
             tokenizer_path,
-            max_chars: env_usize("DEN_EMBED_MAX_CHARS", 8000, 500),
-            max_batch: env_usize("DEN_EMBED_MAX_BATCH", 512, 1),
-            max_body_bytes: env_usize("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024),
-            cache_max: env_usize("DEN_EMBED_CACHE_MAX", 8192, 0),
+            max_chars: env_clamped("DEN_EMBED_MAX_CHARS", 8000, 500, 100_000),
+            // 1024 is the ceiling, not the model's: measured peak RSS is 1219 MB at 1024 tokens and
+            // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
+            max_tokens: env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024),
+            // ~0.33s per 512 tokens measured, so 8192 is ~5s — inside the 10s timeout den-atlas
+            // applies to this call. The CEILING has to respect that too, and strictly: 32768 was
+            // ~21s (double the timeout the comment cited), and 16384 is ~10.5s, still past it.
+            // 12288 is ~7.9s, the largest batch a caller is actually still waiting for.
+            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288),
+            max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
+            max_body_bytes: env_clamped("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+            // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
+            // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
+            // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
+            // cgroup, i.e. both ceilings set at once was an OOM. 32768 is ~137 MB, leaving ~180 MB.
+            cache_max: env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768),
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
-            intra_threads: env_usize("DEN_EMBED_INTRA_THREADS", 0, 0),
+            intra_threads: env_clamped("DEN_EMBED_INTRA_THREADS", 0, 0, 256),
         }
     }
 }
@@ -121,11 +176,11 @@ impl Model {
         let session = builder.commit_from_file(&cfg.onnx_path).map_err(ort_err)?;
         let mut tokenizer =
             Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        // bge-m3 supports 8192 tokens; the tokenizer.json ships no truncation, so
-        // set it explicitly (matches fastembed capping at the model max). Our texts
-        // are pre-truncated to max_chars, so this is only a safety cap for CJK.
+        // bge-m3 supports 8192 tokens, but the ceiling that matters here is memory, not the model:
+        // see `Config::max_tokens`. The tokenizer.json ships no truncation, so this is where the cap
+        // is actually enforced — `max_chars` does not bound tokens for non-Latin text.
         let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-            max_length: 8192,
+            max_length: cfg.max_tokens,
             ..Default::default()
         }));
         Ok(Self { session, tokenizer })
@@ -285,6 +340,37 @@ fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>
     texts.iter().map(|t| embed_one(state, t)).collect()
 }
 
+/// The batch's real token count, capped per text exactly as inference will cap it.
+///
+/// Counting `min(chars, max_tokens)` instead was UNSOUND, and not marginally: the tokenizer's
+/// normalizer is SentencePiece's `Precompiled` NFKC charsmap, which EXPANDS a single scalar before
+/// the model sees it. `㌚` (U+331A) yields 5.05 tokens per character, and 1187 codepoints across the
+/// CJK-compatibility, Arabic-presentation and halfwidth blocks exceed 1 token/char. A 49 KB body of
+/// 80 texts scored 8160 against the 8192 budget and actually cost 40,960 tokens — 5x the ceiling,
+/// ~26s of CPU against a caller that times out at 10s.
+///
+/// Tokenizing costs microseconds against ~330ms of inference per 512 tokens, so measuring beats
+/// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
+/// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
+fn count_tokens(state: &AppState, texts: &[String]) -> anyhow::Result<usize> {
+    let mut guard = state.model.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(Model::load(&state.cfg)?);
+    }
+    let model = guard.as_ref().unwrap();
+    let mut total = 0usize;
+    for t in texts {
+        if is_blank(t) {
+            continue; // short-circuited before inference, costs nothing
+        }
+        let truncated: String = t.chars().take(state.cfg.max_chars).collect();
+        let enc = model.tokenizer.encode(truncated, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Truncation already caps this at max_tokens; the min is belt and braces.
+        total = total.saturating_add(enc.get_ids().len().min(state.cfg.max_tokens));
+    }
+    Ok(total)
+}
+
 // --- HTTP surface (same routes/shapes as server.py) ------------------------
 
 #[derive(Serialize)]
@@ -380,6 +466,32 @@ async fn embed_batch(
             }),
         ));
     }
+    // Bound the TOTAL work, not just the count. Each text is separately capped, but the aggregate is
+    // what saturates the CPU and queues behind the model — 512 x 8000 chars of CJK measured at
+    // ~20-30 minutes of service pinned behind one request.
+    //
+    // MEASURED, not estimated. Two earlier versions of this check were wrong: counting characters
+    // rejected cheap work and admitted expensive work, and `min(chars, max_tokens)` looked sound but
+    // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
+    // `count_tokens`), which let 5x the budget through.
+    let state_for_count = Arc::clone(&state);
+    let texts_for_count = body.texts.clone();
+    let total = tokio::task::spawn_blocking(move || count_tokens(&state_for_count, &texts_for_count))
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map_err(internal)?;
+    if total > state.cfg.max_request_tokens {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrResp {
+                detail: format!(
+                    "batch too large: {total} tokens across {} texts (max {} in total)",
+                    body.texts.len(),
+                    state.cfg.max_request_tokens
+                ),
+            }),
+        ));
+    }
     let vectors =
         tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
             .await
@@ -415,7 +527,12 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
-    ort::init().with_name("den-embed").commit().map_err(ort_err)?;
+    // rc.13 returns bool, not Result: false means an environment was already committed, so this
+    // config simply does not take effect. Nothing else in the process commits one, and there is no
+    // failure to report — but say so rather than discard it silently.
+    if !ort::init().with_name("den-embed").commit() {
+        tracing::warn!("ort environment was already committed; den-embed's configuration is not in effect");
+    }
 
     let cfg = Config::from_env();
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -448,9 +565,213 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("den-embed listening on http://{addr}");
-    axum::serve(listener, app).await?;
-    Ok(())
+    // Registered BEFORE the readiness line, so nothing is told the service is up while a stop signal
+    // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
+    let shutdown = shutdown_signal();
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    tracing::info!("den-embed listening on http://{addr} (port {bound})");
+
+    let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
+    match &outcome {
+        Outcome::Drained => tracing::info!("den-embed: shut down cleanly"),
+        Outcome::DeadlineHit(why) => tracing::warn!("den-embed: {why}"),
+        Outcome::Failed(why) => tracing::error!("den-embed: {why}"),
+    }
+    // EXIT, rather than returning. Returning drops the tokio runtime, and dropping a runtime blocks
+    // until every in-flight `spawn_blocking` finishes — which is where all inference runs. So the
+    // deadline bounded the drain and then the process sat waiting on the very task it had just given
+    // up on: measured 8s deadline, 14.4s actual exit, straight through podman's 10s stop timeout
+    // into a SIGKILL, with the response lost anyway. The whole point of the bound is that the stop
+    // takes a knowable length of time, and only exiting here delivers that.
+    //
+    // It also keeps the second-signal escape alive: that is a spawned task, and dropping the runtime
+    // cancelled it exactly during the window an operator would be pressing ^C again.
+    exit_now(outcome.exit_code());
+}
+
+/// Exit without running `atexit` handlers.
+///
+/// `std::process::exit` calls libc `exit()`, which runs the statically-linked ONNX Runtime's C++
+/// static destructors — while a `Run` may still be executing on a `spawn_blocking` thread. Measured:
+/// in 11 of 12 stops that caught inference, the in-flight Run failed with a bogus internal status
+/// (`GetElementType is not implemented`, naming a different random node each time) logged as an
+/// ERROR indistinguishable from a real inference failure. That is ORT's global state being freed
+/// under a running Run — a use-after-free-shaped race that happened to surface as a status. The same
+/// measurement with `_exit` produced it 0 times in 6.
+///
+/// Nothing here needs an atexit handler: the model is read-only, the cache is in-memory, and stdout
+/// is line-buffered so the log lines are already out. It is flushed anyway, because `_exit` will not.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` terminates the process; it has no preconditions.
+    unsafe { libc_exit(code) }
+}
+
+extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
+}
+
+/// The default drain grace, overridable with `DEN_EMBED_DRAIN_GRACE_SEC`.
+///
+/// Configurable because it is coupled to the container's stop timeout, which is set outside this
+/// binary: raise one and you must raise the other. The default is what is safe with no stop timeout
+/// configured at all, which is how the quadlet currently runs.
+///
+/// The binary is PID 1 in its container (`ENTRYPOINT` exec form), and PID 1 gets no default
+/// terminate action — so without a handler SIGTERM was ignored entirely and podman waited its full
+/// stop timeout before SIGKILLing: a guaranteed ~10s of downtime on every deploy and auto-update,
+/// with every in-flight embed cut. Under podman's DEFAULT 10s, because the quadlet sets no
+/// stop-timeout of its own; an embed is milliseconds warm and ~1.3s cold, so this is generous.
+const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+// The default must finish before the smallest external stop timeout that can apply — podman's and
+// docker's default 10s, which applies whenever the quadlet has not reached the box. A test only
+// guards what someone remembers to run; this fails the build. `MAX_DRAIN_GRACE` is what bounds an
+// operator override, since this assert cannot see one.
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
+
+/// The largest grace that can still finish before something outside kills us.
+///
+/// Sized against podman's DEFAULT 10s, not against the quadlet's `--stop-timeout=25`. That line
+/// exists in the repo but is not on the box — `podman inspect den-embed` reports `StopTimeout=10`,
+/// because the unit file has never been re-provisioned. So a grace of 10..=25 was a value this
+/// binary accepted and advertised as safe while being a guaranteed SIGKILL mid-drain: exactly the
+/// failure the whole mechanism removes.
+///
+/// Strictly below, not equal: podman starts its clock at the signal and kills at the timeout, so a
+/// grace equal to it loses by however long the deadline takes to fire. Raising this needs the
+/// container's stop timeout raised FIRST, and this binary has no way to check that — which is why
+/// the conservative number is the one compiled in.
+const MAX_DRAIN_GRACE: Duration = Duration::from_secs(9);
+
+// Both the default and the ceiling must finish before the smallest external stop timeout that can
+// apply. The default had this assert; the ceiling did not, which is how 25 got in.
+const _: () = assert!(MAX_DRAIN_GRACE.as_secs() < 10);
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() <= MAX_DRAIN_GRACE.as_secs());
+
+fn drain_grace() -> Duration {
+    let secs = env_clamped(
+        "DEN_EMBED_DRAIN_GRACE_SEC",
+        DEFAULT_DRAIN_GRACE.as_secs() as usize,
+        1,
+        MAX_DRAIN_GRACE.as_secs() as usize,
+    );
+    Duration::from_secs(secs as u64)
+}
+
+/// How serving ended. The exit code differs: a drain that ran out of time is expected, a serve
+/// error is not.
+#[derive(Debug)]
+enum Outcome {
+    Drained,
+    DeadlineHit(String),
+    Failed(String),
+}
+
+impl Outcome {
+    /// A drain that ran out of time is a DESIGNED outcome, so it exits 0. Exiting non-zero would put
+    /// the unit into `failed` with Result=exit-code on a routine restart.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Outcome::Drained | Outcome::DeadlineHit(_) => 0,
+            Outcome::Failed(_) => 1,
+        }
+    }
+}
+
+/// Serve until `shutdown` resolves, then drain for at most `grace`.
+///
+/// The bound is the point. `with_graceful_shutdown` waits for every connection task and hyper waits
+/// on one that is mid-request, and there is no header-read timeout anywhere — so a client that opens
+/// a socket and sends half a request head would hold the process open indefinitely, making restart
+/// downtime a function of what an arbitrary client does with a TCP socket.
+///
+/// `shutdown` is a parameter rather than a direct call so a test can trigger the drain without
+/// signalling the test runner itself.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Outcome {
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = signalled_tx.send(());
+    });
+    tokio::select! {
+        r = serve => match r {
+            Ok(()) => Outcome::Drained,
+            Err(e) => Outcome::Failed(format!("serve error: {e}")),
+        },
+        _ = async {
+            // The clock starts when the signal ARRIVES, not when the server does — and a DROPPED
+            // sender is not an arrival. `oneshot` resolves `Err` immediately when the sender drops,
+            // which would start the grace at that instant; today the only path that drops it also
+            // completes `serve`, which wins the select, but that is a coincidence to rely on.
+            if signalled_rx.await.is_err() {
+                std::future::pending::<()>().await
+            }
+            tokio::time::sleep(grace).await;
+        } => Outcome::DeadlineHit(format!("drain deadline ({grace:?}) reached with requests still in flight")),
+    }
+}
+
+/// Resolves when the process is asked to stop. Handlers are registered eagerly, by the caller.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
+        tokio::select! {
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
+        }
+        // A SECOND signal ends it now. Both handles are dropped by here and tokio does not restore
+        // the default disposition when a `Signal` drops, so without re-registering every later
+        // SIGTERM and ^C would be caught and discarded and only SIGKILL would work.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            tracing::warn!("den-embed: second signal — exiting without finishing the drain");
+            // `exit_now`, for the same reason as the deadline path — and this is where the hazard is
+            // MOST likely, because you press ^C again precisely when inference is holding the drain
+            // open. Measured with `process::exit`: 3 of 3 second-signal stops logged a bogus ORT
+            // status naming a random node, against 0 of 2 controls. Fixing one call site and not the
+            // other left the worse one behind.
+            exit_now(0);
+        });
+    }
+}
+
+/// Resolve when this signal arrives, or NEVER if it could not be registered — resolving immediately
+/// would shut the server down the moment it started, which is worse than the hard kill it replaces.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            tracing::info!("den-embed: {name} — draining in-flight requests");
+        }
+        Err(e) => {
+            tracing::error!("den-embed: {name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+/// Like `wait_for`, but silent — the caller prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +809,72 @@ mod tests {
         assert!(is_blank(""));
         assert!(is_blank("   "));
         assert!(!is_blank("hola"));
+    }
+
+    /// The token cap is what bounds activation memory, and `max_chars` does not imply it: at the
+    /// 8000-char limit, Hangul and emoji tokenize to ~8000 tokens, and peak RSS measured 1598 MB at
+    /// 2048 tokens against a 1536 MB cgroup — a ~10 KB request was an OOM-kill.
+    #[test]
+    fn the_token_cap_is_below_what_the_memory_limit_allows() {
+        let cfg = Config::from_env();
+        assert!(cfg.max_tokens <= 1024, "max_tokens {} exceeds what 1536 MB can hold", cfg.max_tokens);
+        assert!(cfg.max_tokens >= 16, "max_tokens {} is too small to embed a query", cfg.max_tokens);
+    }
+
+    /// Per-text limits bound nothing in aggregate: max_batch x max_chars is 4M characters through a
+    /// serial loop that holds the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Asserted on the CLAMPS rather than on `Config::from_env()`, because from_env with no
+    /// environment set only ever reports the compiled-in defaults — a test that reads like a runtime
+    /// guard and is really just documentation. These check that no OPERATOR setting can undo the
+    /// bound, which is the part that matters.
+    #[test]
+    fn no_env_setting_can_undo_the_request_budget() {
+        let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
+        // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
+        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288);
+        // den-atlas times this call out at 10s. A ceiling that permits more than that is a batch
+        // nobody is still waiting for — the earlier 32768 allowed ~21s, double the timeout.
+        assert!(
+            worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 10.0,
+            "a legal batch can outlast den-atlas's 10s timeout on this call"
+        );
+
+        // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
+        // at 2048, against a 1536 MB cgroup.
+        std::env::set_var("DEN_EMBED_MAX_TOKENS", "8192");
+        let raised = env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024);
+        std::env::remove_var("DEN_EMBED_MAX_TOKENS");
+        assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
+
+        // The ceilings have to hold TOGETHER, not one at a time. Measured: 1219 MB peak at 1024
+        // tokens, ~4.2 KB per cache entry, against a 1536 MB cgroup — so both at maximum has to
+        // still leave room. Setting each ceiling against the OTHER's default is how 1494 MB got
+        // signed off as safe.
+        let peak_at_max_tokens_mb = 1219.0;
+        let cache_ceiling = env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768);
+        let cache_mb = cache_ceiling as f64 * 4.2 / 1024.0;
+        assert!(
+            peak_at_max_tokens_mb + cache_mb < 1400.0,
+            "both ceilings at once is {:.0} MB against a 1536 MB cgroup",
+            peak_at_max_tokens_mb + cache_mb
+        );
+    }
+
+    /// A malformed value must not silently become the opposite of what was asked for.
+    /// `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed as nothing and fell back to 0 — always-warm, ~1 GB
+    /// resident forever — with no line anywhere saying so.
+    #[test]
+    fn a_malformed_setting_falls_back_to_the_default_not_to_zero() {
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "600s");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "-5");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("DEN_EMBED_TEST_MALFORMED", " 42 ");
+        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 42, "a padded number is still a number");
+        std::env::remove_var("DEN_EMBED_TEST_MALFORMED");
     }
 
     #[test]

@@ -1,11 +1,56 @@
 # CLAUDE.md — den-embed
 
 bge-m3 int8 embedding service for den-atlas's semantic search. **Rust** (axum + `ort`/ONNX Runtime +
-HuggingFace `tokenizers`) — a rewrite of the former Python/fastembed service, byte-identical in output
-(same tokenizer.json + same model_int8.onnx on the same ONNX Runtime; see `tests/parity_check.py`) but
-with a far smaller idle footprint. The model is **baked into the image** at build time (no runtime
-download → no boot-time crash-loop). Runs as a rootful-podman **Quadlet** container in the `den` stack
+HuggingFace `tokenizers`) — a rewrite of the former Python/fastembed service with a far smaller idle
+footprint.
+
+**Byte-parity with the Python service ended at ONNX Runtime 1.28** (ort rc.13; rc.10 pinned 1.22).
+Same tokenizer.json and same model_int8.onnx, but the native engine's int8 kernels changed. Measured
+over 168 texts, both engines bit-deterministic run to run: every text differs, a mean of 457 of 1024
+dims move, by at most 3/127, cosine(old, new) 0.975-0.984.
+
+**This does reorder results.** With the corpus still on 1.22 and only this service bumped: top-1
+flips for 1 of 30 queries, top-3 ordering holds for 83%, top-5 for 33%, and top-10 ordering for
+*none* of them — about 0.7 of every 10 results churn, and ~7% of pairwise orderings inside the old
+top-10 invert. The reason is that the gap that decides ranking is between ADJACENT results, not
+between unrelated texts: the median top1-to-top2 score gap is 0.033 and the median per-query score
+change is 0.031. Those are the same size. (An earlier version of this note compared the drift
+against the 0.23-0.67 spread between unrelated texts and concluded it was an order of magnitude
+too small to matter. That was the wrong denominator.)
+
+What is NOT affected: exact and near-duplicate retrieval is unchanged — over 54 near-duplicate
+variants against 84 documents, both engines score 100% rank-1, MRR 1.000. The churn is also
+symmetric; individual queries get better as often as worse. So this is reshuffling among close
+neighbours, not a measurable quality regression — but it is not nothing, and it is unpredictable
+per query.
+
+The consequence to keep in mind: this service embeds the QUERY, and the corpus vectors come from
+den-dataset. They want the same runtime. Bump them separately and rows will visibly reshuffle with
+no way to tell it from a regression. `tests/parity_check.py` still works, but its golden set is now
+a record of 1.22, not a gate.
+
+The model is **baked into the image** at build time (no runtime download → no boot-time crash-loop).
+Runs as a rootful-podman **Quadlet** container in the `den` stack
 on the homelab box (`den/deploy/quadlet/den-embed.container`), reached by atlas at `http://den-embed:8080`.
+
+## Limits: this service is sized for QUERIES, not documents
+
+`DEN_EMBED_MAX_TOKENS` (512) caps each text, and `DEN_EMBED_MAX_REQUEST_TOKENS` (8192) caps a whole
+request. Both are memory/latency bounds with measurements behind them, not guesses: peak RSS is
+1219 MB at 1024 tokens and 1598 MB at 2048 against a 1536 MB cgroup, and inference runs ~0.33 s per
+512 tokens while holding the model lock, so 8192 tokens is ~5 s — inside the 10 s timeout den-atlas
+puts on this call. Both are clamped, so no env value can raise them back into the failures they
+exist to prevent.
+
+**Truncation is silent, and that matters for one caller.** `den-dataset/scripts/embed-corpus-run.sh`
+builds the CORPUS by booting an embed service with `DEN_EMBED_MAX_CHARS=5000` and feeding it
+documents. It currently boots `uvicorn server:app` — the Python service, which no longer exists in
+this repo — so it is already broken; the trap is that pointing it at the Rust service looks like the
+obvious fix. Documents would then be cut to 512 tokens with nothing logged and nothing in the
+response saying so, while the existing corpus was embedded at up to ~5000. If you need to embed
+documents, raise `DEN_EMBED_MAX_TOKENS` deliberately (and check the memory numbers above first) —
+do not let the default apply by accident. Note also that `DEN_EMBED_BATCH`, which that script sets,
+is not read by this service at all.
 
 ## Releasing — READ THIS: code on `main` ≠ running on the box
 
@@ -47,7 +92,7 @@ isn't re-explored:
 
 | option | verdict |
 |---|---|
-| **int8 + ORT (this)** | baseline — idle 43 MB, warm 1.2 GB, image 690 MB, cold 1.3 s, byte-parity |
+| **int8 + ORT (this)** | baseline — idle 43 MB, warm 1.2 GB, image 690 MB, cold 1.3 s |
 | fp16 (ORT or Candle) | **only quality-positive: +1.5% nDCG / +4% MRR** (measured, plotless corpus) — but needs a full corpus re-embed, ~2× model/warm, slower cold. Quality-only play, not footprint. |
 | q4 GGUF | **worse** than int8 (−8% nDCG). Dead. |
 | smaller model (e5-small) | **worse** (−12.5% nDCG), only faster. Dead. |

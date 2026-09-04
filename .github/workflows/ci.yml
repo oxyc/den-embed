@@ -20,6 +20,28 @@ jobs:
       # a live instance + golden vectors, not in CI.
       - run: cargo test --locked
 
+      # Denied, not reported. This is not style policing: a working tree once had the entire
+      # shutdown path dead — `main` still called plain `axum::serve`, so SIGTERM was caught and
+      # discarded and the process could only be killed with SIGKILL. Three clippy lines named it
+      # (unused variable `shutdown`, variants never constructed, function never used) and nothing in
+      # CI was running them.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # The image is what actually ships, and it builds differently from `cargo build` (musl-free debian,
+  # static ORT, a 555 MB model fetch). Catching a Dockerfile break here rather than at `git tag` time,
+  # WITHOUT pushing — the release job below is still the only thing that publishes.
+  image-builds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   image:
     # Build + push the model-baked image ONLY on a v* tag (a deliberate release) or a manual run — NOT
     # every main push. Tests still run on push/PR; the box updates only when you cut a tag. Matches the

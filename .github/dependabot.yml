@@ -13,6 +13,15 @@ updates:
       # Patch/minor together: they are the ones that should be boring to review.
       rust-minor:
         update-types: [minor, patch]
+        # ort is version-pinned to an exact PRE-RELEASE (=2.0.0-rc.N). rc.10 -> rc.13 shares the
+        # 2.0.0 prefix, so dependabot classifies it as a patch and drops it in here with the boring
+        # ones — and it is never boring: rc.13 required a new TLS feature and broke three APIs, and
+        # it moves the native ONNX Runtime by six minor versions, which changes the vectors (see
+        # CLAUDE.md). Grouped with anything else, the whole group fails to build and sits open, which
+        # is exactly what happened. On its own it is a PR someone reads.
+        exclude-patterns: ["ort"]
+      ort:
+        patterns: ["ort"]
     labels: [dependencies]
 
   - package-ecosystem: docker

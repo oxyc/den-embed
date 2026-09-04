@@ -10,7 +10,12 @@
 #     the Python image did via fastembed's warm-up.
 
 # ---- build: compile the binary (ONNX Runtime is STATICALLY linked) ---------------
-FROM rust:1-bookworm AS build
+# TRIXIE, not bookworm. ONNX Runtime 1.28 (ort rc.13) ships a static archive built against
+# libstdc++ 13+: linking it on bookworm fails with undefined `std::__cxx11::basic_string<wchar_t>
+# ::_M_replace_cold` and friends, because Debian 12 ships GCC 12 and that symbol does not exist
+# there. Confirmed by inspecting the image's own libstdc++. The build and runtime stages must move
+# together — ORT is static, but the binary still links libstdc++ dynamically.
+FROM rust:1-trixie AS build
 WORKDIR /src
 
 # tokenizers' `onig` regex backend builds a C library → needs a C toolchain.
@@ -26,16 +31,25 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
 # ---- model: fetch the baked artifacts -------------------------------------------
-FROM debian:bookworm-slim AS model
+FROM debian:trixie-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /models
-ARG HF=https://huggingface.co/Xenova/bge-m3/resolve/main
+# PINNED to a commit, and checksum-verified. `main` is a moving branch ref: every release rebuild
+# baked whatever HuggingFace served at that moment, unverified — for a service whose entire contract
+# is that its vectors match a corpus embedded separately. An upstream re-quantization would have
+# shipped silently and been indistinguishable from the ONNX Runtime drift documented in CLAUDE.md.
+ARG HF_REV=4de13258303883538bd53b696b452bf8099f0858
+ARG HF=https://huggingface.co/Xenova/bge-m3/resolve/${HF_REV}
+ARG MODEL_SHA256=a206e10e995aa2a833924bcd725ba5dd6c3425cd34bac3cf2b5677cd2a1c51d6
+ARG TOKENIZER_SHA256=6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790
 RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
-    && curl -fsSL "$HF/tokenizer.json" -o tokenizer.json
+    && curl -fsSL "$HF/tokenizer.json" -o tokenizer.json \
+    && echo "${MODEL_SHA256}  model_int8.onnx" | sha256sum -c - \
+    && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
 # ---- runtime --------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 WORKDIR /app
 
 # ONNX Runtime's OpenMP runtime dep. No shell tools on the health path.
