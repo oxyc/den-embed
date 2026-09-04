@@ -22,7 +22,7 @@ panic = "abort"
 [dependencies]
 # ONNX Runtime — the SAME native engine the Python service used via fastembed, so
 # the same model_int8.onnx on the same CPU provider yields identical tensors.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries"] }
 ndarray = "0.16"
 # HuggingFace tokenizers — the SAME Rust crate fastembed wraps, so loading the
 # same tokenizer.json gives byte-identical token ids.
