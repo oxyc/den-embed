@@ -34,6 +34,21 @@ use tokenizers::Tokenizer;
 const MODEL_LABEL: &str = "bge-m3";
 const DIMS: usize = 1024;
 
+/// Bumped ONLY when this service's vector OUTPUT changes for the same input.
+///
+/// The crate version cannot serve this purpose, and using it was a bug: den-dataset records the embedder
+/// identity with each corpus and refuses to append a different one, so with the version as the identity a
+/// release that touched nothing but a log line would invalidate a 37.5k-title corpus and demand hours of
+/// re-embedding. Equally, `model` and `dims` alone are too coarse — they say bge-m3/1024 for every
+/// generation, including the ORT 1.22 -> 1.28 bump that DID move int8 output.
+///
+/// So: bump this for an ONNX Runtime upgrade, a model or revision change, a pooling or normalisation
+/// change, or anything else that moves the numbers. Do NOT bump it for anything else.
+///
+/// 1 = the Rust service (ORT 1.28). The Python/ORT-1.22 generation that built the corpus shipping today
+/// predates the field entirely and reads back as 0, which is correctly not equal to this.
+const VECTOR_EPOCH: u32 = 1;
+
 /// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
 /// into `anyhow::Error` directly; map it through its Display.
 ///
@@ -378,15 +393,13 @@ struct HealthResp {
     status: &'static str,
     model: &'static str,
     dims: usize,
-    /// What actually produced the numbers, beyond the model name.
-    ///
-    /// `model` and `dims` are "bge-m3" and 1024 across every version of this service, so they cannot
-    /// distinguish two runtimes that return DIFFERENT vectors for the same text — and two of ours do:
-    /// ONNX Runtime 1.22 → 1.28 shifted int8 output, and the Rust rewrite added a hard token cap the
-    /// Python service never had. A corpus embedded by one and queried through the other is the exact
-    /// silent-drift failure den-dataset's alignment rule exists to prevent, and until now nothing on
-    /// either side could see it. den-dataset records this string with the corpus it builds.
+    /// Which generation of vectors this serves — see `VECTOR_EPOCH`. This, `dims` and `max_tokens` are
+    /// what den-dataset compares; a corpus built under a different epoch cannot be appended to.
+    vector_epoch: u32,
+    /// Human-readable build identity, for logs and error messages. NOT part of the comparison: it changes
+    /// on every release, and treating it as the identity would invalidate a corpus over a log-line fix.
     runtime: String,
+    /// Documents are truncated here, so changing it changes the vectors for anything longer.
     max_tokens: usize,
 }
 
@@ -436,15 +449,12 @@ fn internal(e: anyhow::Error) -> AppErr {
     )
 }
 
-// The service's OWN version is the runtime identity. There is no stable API for the linked ONNX
-// Runtime version, and a hand-maintained constant would drift from Cargo.toml the first time it was
-// forgotten — whereas this crate's version is bumped for exactly the changes that move vectors (3.0.0
-// IS the ORT 1.22 → 1.28 bump), so it cannot silently disagree with what is running.
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
     Json(HealthResp {
         status: "ok",
         model: MODEL_LABEL,
         dims: DIMS,
+        vector_epoch: VECTOR_EPOCH,
         runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
         max_tokens: state.cfg.max_tokens,
     })
@@ -801,17 +811,17 @@ async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
 mod tests {
     use super::*;
 
-    /// /health has to carry something that distinguishes two runtimes returning DIFFERENT vectors for
-    /// the same text, because `model` and `dims` do not: every generation of this service says bge-m3
-    /// and 1024. den-dataset records these two fields with the corpus it builds and refuses to append to
-    /// a store built by a different one, so dropping either from the response silently restores the
-    /// undetectable drift.
+    /// /health has to distinguish two builds that return DIFFERENT vectors for the same text, because
+    /// `model` and `dims` do not: every generation says bge-m3 and 1024. den-dataset records these fields
+    /// with the corpus it builds and refuses to append a different identity, so dropping one silently
+    /// restores the undetectable drift.
     #[test]
     fn health_reports_what_actually_embedded() {
         let body = serde_json::to_value(HealthResp {
             status: "ok",
             model: MODEL_LABEL,
             dims: DIMS,
+            vector_epoch: VECTOR_EPOCH,
             runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
             max_tokens: 512,
         })
@@ -820,10 +830,16 @@ mod tests {
         assert_eq!(body["model"], MODEL_LABEL);
         assert_eq!(body["dims"], DIMS);
         assert_eq!(body["max_tokens"], 512);
-        // The crate version IS the runtime identity — it is bumped for exactly the changes that move
-        // vectors, so it cannot drift from what is running the way a hand-kept constant would.
+        assert_eq!(body["vector_epoch"], VECTOR_EPOCH);
         assert_eq!(body["runtime"], format!("den-embed/{}", env!("CARGO_PKG_VERSION")));
         assert_ne!(body["runtime"], "den-embed/");
+    }
+
+    /// The epoch must NOT track the crate version. If it did, a release that changed nothing about the
+    /// numbers would invalidate every corpus built before it — hours of re-embedding for a log-line fix.
+    #[test]
+    fn the_vector_epoch_is_not_the_crate_version() {
+        assert!(!env!("CARGO_PKG_VERSION").starts_with(&VECTOR_EPOCH.to_string()));
     }
 
     // Pins the quantization contract (mirrors the Python tests/test_quantize.py).
