@@ -139,13 +139,18 @@ impl Config {
             // 1024 is the ceiling, not the model's: measured peak RSS is 1219 MB at 1024 tokens and
             // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
             max_tokens: env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024),
-            // ~0.33s per 512 tokens measured, so 8192 is ~5s of held model lock — inside the 10s
-            // timeout den-atlas applies to this call. 32768 would exceed it.
-            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 32_768),
+            // ~0.33s per 512 tokens measured, so 8192 is ~5s — inside the 10s timeout den-atlas
+            // applies to this call. The CEILING has to respect that too: 32768 would be ~21s, double
+            // the caller's timeout, so the clamp would have permitted exactly what the comment said
+            // was out of bounds. 16384 is ~10.5s, the most that can still be waited for.
+            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 16_384),
             max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
             max_body_bytes: env_clamped("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
-            // Each entry is ~4.2 KB, so this is the cache's memory bound too: 65536 is ~275 MB.
-            cache_max: env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 65_536),
+            // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
+            // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
+            // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
+            // cgroup, i.e. both ceilings set at once was an OOM. 32768 is ~137 MB, leaving ~180 MB.
+            cache_max: env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768),
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
             intra_threads: env_clamped("DEN_EMBED_INTRA_THREADS", 0, 0, 256),
@@ -335,6 +340,37 @@ fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>
     texts.iter().map(|t| embed_one(state, t)).collect()
 }
 
+/// The batch's real token count, capped per text exactly as inference will cap it.
+///
+/// Counting `min(chars, max_tokens)` instead was UNSOUND, and not marginally: the tokenizer's
+/// normalizer is SentencePiece's `Precompiled` NFKC charsmap, which EXPANDS a single scalar before
+/// the model sees it. `㌚` (U+331A) yields 5.05 tokens per character, and 1187 codepoints across the
+/// CJK-compatibility, Arabic-presentation and halfwidth blocks exceed 1 token/char. A 49 KB body of
+/// 80 texts scored 8160 against the 8192 budget and actually cost 40,960 tokens — 5x the ceiling,
+/// ~26s of CPU against a caller that times out at 10s.
+///
+/// Tokenizing costs microseconds against ~330ms of inference per 512 tokens, so measuring beats
+/// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
+/// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
+fn count_tokens(state: &AppState, texts: &[String]) -> anyhow::Result<usize> {
+    let mut guard = state.model.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(Model::load(&state.cfg)?);
+    }
+    let model = guard.as_ref().unwrap();
+    let mut total = 0usize;
+    for t in texts {
+        if is_blank(t) {
+            continue; // short-circuited before inference, costs nothing
+        }
+        let truncated: String = t.chars().take(state.cfg.max_chars).collect();
+        let enc = model.tokenizer.encode(truncated, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Truncation already caps this at max_tokens; the min is belt and braces.
+        total = total.saturating_add(enc.get_ids().len().min(state.cfg.max_tokens));
+    }
+    Ok(total)
+}
+
 // --- HTTP surface (same routes/shapes as server.py) ------------------------
 
 #[derive(Serialize)]
@@ -430,21 +466,26 @@ async fn embed_batch(
             }),
         ));
     }
-    // Bound the TOTAL work, not just the count. Each text is separately capped, but `embed_many` is
-    // a serial loop holding the model lock, so the aggregate is what decides how long every other
-    // request waits — 512 x 8000 chars of CJK measured at ~20-30 minutes of held lock.
+    // Bound the TOTAL work, not just the count. Each text is separately capped, but the aggregate is
+    // what saturates the CPU and queues behind the model — 512 x 8000 chars of CJK measured at
+    // ~20-30 minutes of service pinned behind one request.
     //
-    // In TOKENS, not characters: `min(chars, max_tokens)` is an upper bound on what inference sees,
-    // since a text yields at most one token per character and truncation caps it anyway. Counting
-    // characters was wrong in both directions — it rejected 3 x 8000 English characters (1536
-    // tokens, ~1s) while admitting 32 x 512 CJK characters (16384 tokens, ~10s).
-    let total: usize = body.texts.iter().map(|t| t.chars().count().min(state.cfg.max_tokens)).sum();
+    // MEASURED, not estimated. Two earlier versions of this check were wrong: counting characters
+    // rejected cheap work and admitted expensive work, and `min(chars, max_tokens)` looked sound but
+    // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
+    // `count_tokens`), which let 5x the budget through.
+    let state_for_count = Arc::clone(&state);
+    let texts_for_count = body.texts.clone();
+    let total = tokio::task::spawn_blocking(move || count_tokens(&state_for_count, &texts_for_count))
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map_err(internal)?;
     if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrResp {
                 detail: format!(
-                    "batch too large: ~{total} tokens across {} texts (max {} in total)",
+                    "batch too large: {total} tokens across {} texts (max {} in total)",
                     body.texts.len(),
                     state.cfg.max_request_tokens
                 ),
@@ -768,9 +809,13 @@ mod tests {
     fn no_env_setting_can_undo_the_request_budget() {
         let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
         // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
-        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 32_768);
-        assert!(ceiling <= 32_768);
-        assert!(worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 25.0, "a legal batch can outlast any caller");
+        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 16_384);
+        // den-atlas times this call out at 10s. A ceiling that permits more than that is a batch
+        // nobody is still waiting for — the earlier 32768 allowed ~21s, double the timeout.
+        assert!(
+            worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 11.0,
+            "a legal batch can outlast the caller that made it"
+        );
 
         // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
         // at 2048, against a 1536 MB cgroup.
@@ -778,6 +823,19 @@ mod tests {
         let raised = env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024);
         std::env::remove_var("DEN_EMBED_MAX_TOKENS");
         assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
+
+        // The ceilings have to hold TOGETHER, not one at a time. Measured: 1219 MB peak at 1024
+        // tokens, ~4.2 KB per cache entry, against a 1536 MB cgroup — so both at maximum has to
+        // still leave room. Setting each ceiling against the OTHER's default is how 1494 MB got
+        // signed off as safe.
+        let peak_at_max_tokens_mb = 1219.0;
+        let cache_ceiling = env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768);
+        let cache_mb = cache_ceiling as f64 * 4.2 / 1024.0;
+        assert!(
+            peak_at_max_tokens_mb + cache_mb < 1400.0,
+            "both ceilings at once is {:.0} MB against a 1536 MB cgroup",
+            peak_at_max_tokens_mb + cache_mb
+        );
     }
 
     /// A malformed value must not silently become the opposite of what was asked for.
