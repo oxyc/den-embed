@@ -378,6 +378,16 @@ struct HealthResp {
     status: &'static str,
     model: &'static str,
     dims: usize,
+    /// What actually produced the numbers, beyond the model name.
+    ///
+    /// `model` and `dims` are "bge-m3" and 1024 across every version of this service, so they cannot
+    /// distinguish two runtimes that return DIFFERENT vectors for the same text — and two of ours do:
+    /// ONNX Runtime 1.22 → 1.28 shifted int8 output, and the Rust rewrite added a hard token cap the
+    /// Python service never had. A corpus embedded by one and queried through the other is the exact
+    /// silent-drift failure den-dataset's alignment rule exists to prevent, and until now nothing on
+    /// either side could see it. den-dataset records this string with the corpus it builds.
+    runtime: String,
+    max_tokens: usize,
 }
 
 #[derive(Serialize)]
@@ -426,8 +436,18 @@ fn internal(e: anyhow::Error) -> AppErr {
     )
 }
 
-async fn health() -> Json<HealthResp> {
-    Json(HealthResp { status: "ok", model: MODEL_LABEL, dims: DIMS })
+// The service's OWN version is the runtime identity. There is no stable API for the linked ONNX
+// Runtime version, and a hand-maintained constant would drift from Cargo.toml the first time it was
+// forgotten — whereas this crate's version is bumped for exactly the changes that move vectors (3.0.0
+// IS the ORT 1.22 → 1.28 bump), so it cannot silently disagree with what is running.
+async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
+    Json(HealthResp {
+        status: "ok",
+        model: MODEL_LABEL,
+        dims: DIMS,
+        runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
+        max_tokens: state.cfg.max_tokens,
+    })
 }
 
 async fn embed_get(
@@ -780,6 +800,31 @@ async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// /health has to carry something that distinguishes two runtimes returning DIFFERENT vectors for
+    /// the same text, because `model` and `dims` do not: every generation of this service says bge-m3
+    /// and 1024. den-dataset records these two fields with the corpus it builds and refuses to append to
+    /// a store built by a different one, so dropping either from the response silently restores the
+    /// undetectable drift.
+    #[test]
+    fn health_reports_what_actually_embedded() {
+        let body = serde_json::to_value(HealthResp {
+            status: "ok",
+            model: MODEL_LABEL,
+            dims: DIMS,
+            runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
+            max_tokens: 512,
+        })
+        .unwrap();
+
+        assert_eq!(body["model"], MODEL_LABEL);
+        assert_eq!(body["dims"], DIMS);
+        assert_eq!(body["max_tokens"], 512);
+        // The crate version IS the runtime identity — it is bumped for exactly the changes that move
+        // vectors, so it cannot drift from what is running the way a hand-kept constant would.
+        assert_eq!(body["runtime"], format!("den-embed/{}", env!("CARGO_PKG_VERSION")));
+        assert_ne!(body["runtime"], "den-embed/");
+    }
 
     // Pins the quantization contract (mirrors the Python tests/test_quantize.py).
     // End-to-end byte-parity with the Python service is covered by tests/parity_check.py.
