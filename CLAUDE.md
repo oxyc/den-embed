@@ -5,16 +5,29 @@ HuggingFace `tokenizers`) — a rewrite of the former Python/fastembed service w
 footprint.
 
 **Byte-parity with the Python service ended at ONNX Runtime 1.28** (ort rc.13; rc.10 pinned 1.22).
-Same tokenizer.json and same model_int8.onnx, but the native engine's int8 kernels changed: measured
-over 20 texts, every one differs — about half the 1024 dims move, by at most 3/127. What that costs
-retrieval was measured too, and it is very little: cosine(old, new) for the same text is 0.976-0.987,
-while two DIFFERENT texts sit at 0.23-0.67, so the drift is an order of magnitude smaller than the
-gap it would have to cross. Zero nearest-neighbour flips over that set.
+Same tokenizer.json and same model_int8.onnx, but the native engine's int8 kernels changed. Measured
+over 168 texts, both engines bit-deterministic run to run: every text differs, a mean of 457 of 1024
+dims move, by at most 3/127, cosine(old, new) 0.975-0.984.
+
+**This does reorder results.** With the corpus still on 1.22 and only this service bumped: top-1
+flips for 1 of 30 queries, top-3 ordering holds for 83%, top-5 for 33%, and top-10 ordering for
+*none* of them — about 0.7 of every 10 results churn, and ~7% of pairwise orderings inside the old
+top-10 invert. The reason is that the gap that decides ranking is between ADJACENT results, not
+between unrelated texts: the median top1-to-top2 score gap is 0.033 and the median per-query score
+change is 0.031. Those are the same size. (An earlier version of this note compared the drift
+against the 0.23-0.67 spread between unrelated texts and concluded it was an order of magnitude
+too small to matter. That was the wrong denominator.)
+
+What is NOT affected: exact and near-duplicate retrieval is unchanged — over 54 near-duplicate
+variants against 84 documents, both engines score 100% rank-1, MRR 1.000. The churn is also
+symmetric; individual queries get better as often as worse. So this is reshuffling among close
+neighbours, not a measurable quality regression — but it is not nothing, and it is unpredictable
+per query.
 
 The consequence to keep in mind: this service embeds the QUERY, and the corpus vectors come from
-den-dataset. They should be built on the same runtime. If search quality ever looks subtly wrong
-after a runtime bump on one side only, this is the first thing to check. `tests/parity_check.py`
-still works, but its golden set is now a record of 1.22, not a gate.
+den-dataset. They want the same runtime. Bump them separately and rows will visibly reshuffle with
+no way to tell it from a regression. `tests/parity_check.py` still works, but its golden set is now
+a record of 1.22, not a gate.
 
 The model is **baked into the image** at build time (no runtime download → no boot-time crash-loop).
 Runs as a rootful-podman **Quadlet** container in the `den` stack

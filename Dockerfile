@@ -30,9 +30,18 @@ FROM debian:bookworm-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /models
-ARG HF=https://huggingface.co/Xenova/bge-m3/resolve/main
+# PINNED to a commit, and checksum-verified. `main` is a moving branch ref: every release rebuild
+# baked whatever HuggingFace served at that moment, unverified — for a service whose entire contract
+# is that its vectors match a corpus embedded separately. An upstream re-quantization would have
+# shipped silently and been indistinguishable from the ONNX Runtime drift documented in CLAUDE.md.
+ARG HF_REV=4de13258303883538bd53b696b452bf8099f0858
+ARG HF=https://huggingface.co/Xenova/bge-m3/resolve/${HF_REV}
+ARG MODEL_SHA256=a206e10e995aa2a833924bcd725ba5dd6c3425cd34bac3cf2b5677cd2a1c51d6
+ARG TOKENIZER_SHA256=6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790
 RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
-    && curl -fsSL "$HF/tokenizer.json" -o tokenizer.json
+    && curl -fsSL "$HF/tokenizer.json" -o tokenizer.json \
+    && echo "${MODEL_SHA256}  model_int8.onnx" | sha256sum -c - \
+    && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
 # ---- runtime --------------------------------------------------------------------
 FROM debian:bookworm-slim
