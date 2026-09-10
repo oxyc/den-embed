@@ -76,9 +76,10 @@ unsafe fn malloc_trim(_pad: usize) -> i32 {
 }
 
 // --- config from env ---------------------------------------------------------
-// PORT is unprefixed because every den addon reads the same name for it; the DEN_EMBED_* knobs are
-// this service's own. There is no host knob: like every other addon it binds 0.0.0.0, and staying
-// off the LAN is the container network's job (no published port), not the bind address's.
+// No name carries an addon prefix: the container is the namespace, so PORT, METRICS_TOKEN and the
+// knobs below read the same way in every den addon. There is no host knob: like every other addon it
+// binds 0.0.0.0, and staying off the LAN is the container network's job (no published port), not the
+// bind address's.
 struct Config {
     port: u16,
     onnx_path: String,
@@ -113,13 +114,13 @@ struct Config {
 
 /// Read a numeric env var, clamped to `[min, max]`.
 ///
-/// A malformed value is REPORTED, not silently replaced: `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed
+/// A malformed value is REPORTED, not silently replaced: `IDLE_UNLOAD_SECS='600s'` parsed
 /// as nothing and fell back to 0, which means always-warm — ~1 GB resident forever, the exact
 /// opposite of what the operator asked for, with no line anywhere saying so. That value lives in
 /// /etc/den/env on the box, outside this repo, so nothing reviews it either.
 ///
 /// `max` matters as much as `min`: several of these bound memory, and an out-of-range value silently
-/// restores the failure the bound exists to prevent (`DEN_EMBED_MAX_TOKENS=8192` is the OOM again).
+/// restores the failure the bound exists to prevent (`MAX_TOKENS=8192` is the OOM again).
 fn env_clamped(key: &str, default: usize, min: usize, max: usize) -> usize {
     match std::env::var(key) {
         Err(_) => default,
@@ -143,41 +144,35 @@ impl Config {
     fn from_env() -> Self {
         // Model files are baked into the image (see Dockerfile). Default to the
         // fixed bake paths; overridable for local dev.
-        let model_dir = std::env::var("DEN_EMBED_MODEL_DIR").unwrap_or_else(|_| "/models".into());
-        let onnx_path =
-            std::env::var("DEN_EMBED_ONNX").unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
+        let model_dir = std::env::var("MODEL_DIR").unwrap_or_else(|_| "/models".into());
+        let onnx_path = std::env::var("ONNX_PATH").unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
         let tokenizer_path =
-            std::env::var("DEN_EMBED_TOKENIZER").unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
+            std::env::var("TOKENIZER_PATH").unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
         // A day is already far past "idle"; anything larger is a typo.
-        let idle = env_clamped("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0, 86_400);
+        let idle = env_clamped("IDLE_UNLOAD_SECS", 0, 0, 86_400);
         Self {
             port: std::env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
             onnx_path,
             tokenizer_path,
-            max_chars: env_clamped("DEN_EMBED_MAX_CHARS", 8000, 500, 100_000),
+            max_chars: env_clamped("MAX_CHARS", 8000, 500, 100_000),
             // 1024 is the ceiling, not the model's: measured peak RSS is 1219 MB at 1024 tokens and
             // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
-            max_tokens: env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024),
+            max_tokens: env_clamped("MAX_TOKENS", 512, 16, 1024),
             // ~0.33s per 512 tokens measured, so 8192 is ~5s — inside the 10s timeout den-atlas
             // applies to this call. The CEILING has to respect that too, and strictly: 32768 was
             // ~21s (double the timeout the comment cited), and 16384 is ~10.5s, still past it.
             // 12288 is ~7.9s, the largest batch a caller is actually still waiting for.
-            max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288),
-            max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
-            max_body_bytes: env_clamped(
-                "DEN_EMBED_MAX_BODY_BYTES",
-                4 * 1024 * 1024,
-                64 * 1024,
-                16 * 1024 * 1024,
-            ),
+            max_request_tokens: env_clamped("MAX_REQUEST_TOKENS", 8192, 512, 12_288),
+            max_batch: env_clamped("MAX_BATCH", 512, 1, 4096),
+            max_body_bytes: env_clamped("MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
             // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
             // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
             // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
             // cgroup, i.e. both ceilings set at once was an OOM. 32768 is ~137 MB, leaving ~180 MB.
-            cache_max: env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768),
+            cache_max: env_clamped("CACHE_MAX_ENTRIES", 8192, 0, 32_768),
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
-            intra_threads: env_clamped("DEN_EMBED_INTRA_THREADS", 0, 0, 256),
+            intra_threads: env_clamped("INTRA_THREADS", 0, 0, 256),
             metrics_token: std::env::var("METRICS_TOKEN")
                 .ok()
                 .map(|t| t.trim().to_string())
@@ -722,7 +717,7 @@ extern "C" {
     fn libc_exit(code: i32) -> !;
 }
 
-/// The default drain grace, overridable with `DEN_EMBED_DRAIN_GRACE_SEC`.
+/// The default drain grace, overridable with `DRAIN_GRACE_SECS`.
 ///
 /// Configurable because it is coupled to the container's stop timeout, which is set outside this
 /// binary: raise one and you must raise the other. The default is what is safe with no stop timeout
@@ -766,7 +761,7 @@ const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() <= MAX_DRAIN_GRACE.as_secs()
 
 fn drain_grace() -> Duration {
     let secs = env_clamped(
-        "DEN_EMBED_DRAIN_GRACE_SEC",
+        "DRAIN_GRACE_SECS",
         DEFAULT_DRAIN_GRACE.as_secs() as usize,
         1,
         MAX_DRAIN_GRACE.as_secs() as usize,
@@ -975,7 +970,7 @@ mod tests {
     fn no_env_setting_can_undo_the_request_budget() {
         let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
         // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
-        let ceiling = env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288);
+        let ceiling = env_clamped("MAX_REQUEST_TOKENS", 8192, 512, 12_288);
         // den-atlas times this call out at 10s. A ceiling that permits more than that is a batch
         // nobody is still waiting for — the earlier 32768 allowed ~21s, double the timeout.
         assert!(
@@ -985,9 +980,9 @@ mod tests {
 
         // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
         // at 2048, against a 1536 MB cgroup.
-        std::env::set_var("DEN_EMBED_MAX_TOKENS", "8192");
-        let raised = env_clamped("DEN_EMBED_MAX_TOKENS", 512, 16, 1024);
-        std::env::remove_var("DEN_EMBED_MAX_TOKENS");
+        std::env::set_var("MAX_TOKENS", "8192");
+        let raised = env_clamped("MAX_TOKENS", 512, 16, 1024);
+        std::env::remove_var("MAX_TOKENS");
         assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
 
         // The ceilings have to hold TOGETHER, not one at a time. Measured: 1219 MB peak at 1024
@@ -995,7 +990,7 @@ mod tests {
         // still leave room. Setting each ceiling against the OTHER's default is how 1494 MB got
         // signed off as safe.
         let peak_at_max_tokens_mb = 1219.0;
-        let cache_ceiling = env_clamped("DEN_EMBED_CACHE_MAX", 8192, 0, 32_768);
+        let cache_ceiling = env_clamped("CACHE_MAX_ENTRIES", 8192, 0, 32_768);
         let cache_mb = cache_ceiling as f64 * 4.2 / 1024.0;
         assert!(
             peak_at_max_tokens_mb + cache_mb < 1400.0,
@@ -1005,23 +1000,19 @@ mod tests {
     }
 
     /// A malformed value must not silently become the opposite of what was asked for.
-    /// `DEN_EMBED_IDLE_UNLOAD_SEC='600s'` parsed as nothing and fell back to 0 — always-warm, ~1 GB
+    /// `IDLE_UNLOAD_SECS='600s'` parsed as nothing and fell back to 0 — always-warm, ~1 GB
     /// resident forever — with no line anywhere saying so.
     #[test]
     fn a_malformed_setting_falls_back_to_the_default_not_to_zero() {
-        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "600s");
-        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
-        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "");
-        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
-        std::env::set_var("DEN_EMBED_TEST_MALFORMED", "-5");
-        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
-        std::env::set_var("DEN_EMBED_TEST_MALFORMED", " 42 ");
-        assert_eq!(
-            env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400),
-            42,
-            "a padded number is still a number"
-        );
-        std::env::remove_var("DEN_EMBED_TEST_MALFORMED");
+        std::env::set_var("TEST_MALFORMED", "600s");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", "");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", "-5");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", " 42 ");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 42, "a padded number is still a number");
+        std::env::remove_var("TEST_MALFORMED");
     }
 
     /// A state as `main` builds it with idle-unload on — model unloaded, idle clock never reset — but a

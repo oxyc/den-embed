@@ -7,7 +7,7 @@
 //! terminate action — before this, SIGTERM was ignored outright and podman SIGKILLed after its stop
 //! timeout, cutting every in-flight embed on every deploy and auto-update.
 //!
-//! `DEN_EMBED_IDLE_UNLOAD_SEC=1` keeps the model unloaded, so these start in well under a second and
+//! `IDLE_UNLOAD_SECS=1` keeps the model unloaded, so these start in well under a second and
 //! never touch the 555 MB ONNX file.
 
 use std::io::{BufRead, BufReader, Write};
@@ -60,19 +60,15 @@ fn start_with(extra: &[(&str, &str)]) -> (Child, u16) {
 }
 
 /// Same, but keeping the server's output — the only way to assert on something it says rather than
-/// on timing. Ambient `DEN_EMBED_*` is cleared: a developer with `DEN_EMBED_DRAIN_GRACE_SEC`
-/// exported would otherwise silently change several tests' timing.
+/// on timing. The ambient environment is cleared: the knobs carry no prefix to filter on, and a
+/// developer with `DRAIN_GRACE_SECS` exported would otherwise silently change several tests' timing.
 fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_den-embed"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("DEN_EMBED_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("PORT", "0")
+    cmd.env_clear()
+        .env("PORT", "0")
         // Lazy-load, so no model file is ever opened.
-        .env("DEN_EMBED_IDLE_UNLOAD_SEC", "1")
-        .env("DEN_EMBED_MODEL_DIR", "/nonexistent-on-purpose")
+        .env("IDLE_UNLOAD_SECS", "1")
+        .env("MODEL_DIR", "/nonexistent-on-purpose")
         // The log, readiness line included, goes to STDERR.
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -238,7 +234,7 @@ fn an_in_flight_request_completes_across_a_stop() {
 /// on the warning rather than waiting out a drain.
 #[test]
 fn an_over_large_drain_grace_is_clamped() {
-    let (mut child, _port, log) = start_logged(&[("DEN_EMBED_DRAIN_GRACE_SEC", "600")]);
+    let (mut child, _port, log) = start_logged(&[("DRAIN_GRACE_SECS", "600")]);
     signal(&child, SIGTERM);
     let status = wait_within(&mut child, Duration::from_secs(20)).expect("never exited");
     assert_eq!(status.code(), Some(0));
@@ -257,7 +253,7 @@ fn an_over_large_drain_grace_is_clamped() {
 /// asserts this property; nothing tested it, and the mutation survived the whole suite.
 #[test]
 fn the_grace_clock_starts_at_the_signal_not_at_boot() {
-    let (mut child, port) = start_with(&[("DEN_EMBED_DRAIN_GRACE_SEC", "2")]);
+    let (mut child, port) = start_with(&[("DRAIN_GRACE_SECS", "2")]);
 
     // Well past the grace, with no signal sent. The service must still be serving.
     std::thread::sleep(Duration::from_secs(4));
@@ -292,7 +288,7 @@ fn the_grace_clock_starts_at_the_signal_not_at_boot() {
 /// podman's 10s stop timeout into a SIGKILL, with the response lost anyway. Exiting instead of
 /// returning is what makes the bound real.
 ///
-/// Needs the real model, so it is skipped unless `DEN_EMBED_TEST_MODEL_DIR` points at a directory
+/// Needs the real model, so it is skipped unless `TEST_MODEL_DIR` points at a directory
 /// holding `model_int8.onnx` + `tokenizer.json`. Skipped rather than faked: nothing smaller than the
 /// real model produces a blocking task long enough to tell the two behaviours apart.
 /// `#[ignore]`, not a silent early return. Returning made CI report `6 passed; 0 ignored` — green,
@@ -300,22 +296,22 @@ fn the_grace_clock_starts_at_the_signal_not_at_boot() {
 /// explanatory `eprintln!` swallowed without `--nocapture`. An absent test must not be
 /// indistinguishable from a passing one. Run it with:
 ///
-///     DEN_EMBED_TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored
+///     TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored
 #[test]
-#[ignore = "needs the 555 MB model; set DEN_EMBED_TEST_MODEL_DIR"]
+#[ignore = "needs the 555 MB model; set TEST_MODEL_DIR"]
 fn inference_in_flight_does_not_extend_the_stop() {
-    let model_dir = std::env::var("DEN_EMBED_TEST_MODEL_DIR")
-        .expect("set DEN_EMBED_TEST_MODEL_DIR to a dir with model_int8.onnx + tokenizer.json");
+    let model_dir = std::env::var("TEST_MODEL_DIR")
+        .expect("set TEST_MODEL_DIR to a dir with model_int8.onnx + tokenizer.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_den-embed"))
         .env("PORT", "0")
-        .env("DEN_EMBED_MODEL_DIR", &model_dir)
-        .env("DEN_EMBED_IDLE_UNLOAD_SEC", "0") // always-warm: load at boot, so the request is the slow part
+        .env("MODEL_DIR", &model_dir)
+        .env("IDLE_UNLOAD_SECS", "0") // always-warm: load at boot, so the request is the slow part
         // A SHORT grace, so the deadline fires well before the batch finishes. At the 8s default the
         // batch completed first, the deadline never fired, and the test passed against the bug.
-        .env("DEN_EMBED_DRAIN_GRACE_SEC", "2")
+        .env("DRAIN_GRACE_SECS", "2")
         // ~32000 tokens of genuinely dense work, so the batch is still running well past the grace.
-        .env("DEN_EMBED_MAX_REQUEST_TOKENS", "32768")
+        .env("MAX_REQUEST_TOKENS", "32768")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

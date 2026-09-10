@@ -17,8 +17,8 @@ produces; den-dataset records it with a corpus and refuses to mix generations.
 ## The path
 
 1. Blank or whitespace-only text returns an all-zero vector, never an error.
-2. The text is cut to `DEN_EMBED_MAX_CHARS` characters, then the tokenizer truncates it to
-   `DEN_EMBED_MAX_TOKENS` tokens. Both cuts are silent.
+2. The text is cut to `MAX_CHARS` characters, then the tokenizer truncates it to `MAX_TOKENS`
+   tokens. Both cuts are silent.
 3. `tokenizer.json` and `onnx/model_int8.onnx` from `Xenova/bge-m3`, pinned to a commit and
    checksum-verified in the Dockerfile, run on the ONNX Runtime CPU provider.
 4. CLS pooling: token 0 of `last_hidden_state`.
@@ -41,8 +41,8 @@ Vectors are cached in memory, keyed by content.
   To prove the service can embed, embed something.
 - `/metrics` answers a bare 404, like an unknown route, when `METRICS_TOKEN` is unset or the token is
   wrong.
-- 413 when a batch has more than `DEN_EMBED_MAX_BATCH` texts or more than
-  `DEN_EMBED_MAX_REQUEST_TOKENS` tokens in total, or a body exceeds `DEN_EMBED_MAX_BODY_BYTES`.
+- 413 when a batch has more than `MAX_BATCH` texts or more than `MAX_REQUEST_TOKENS` tokens in
+  total, or a body exceeds `MAX_BODY_BYTES`.
 - 500 `{"detail":"embedding failed"}` when inference fails; the real error goes to the log.
 
 ## Configuration
@@ -51,17 +51,17 @@ Vectors are cached in memory, keyed by content.
 |---|---|---|---|
 | `PORT` | 8080 | | Listen port, on 0.0.0.0. |
 | `METRICS_TOKEN` | unset | | Enables `/metrics`. |
-| `DEN_EMBED_MODEL_DIR` | `/models` | | Directory holding `model_int8.onnx` and `tokenizer.json`. |
-| `DEN_EMBED_ONNX`, `DEN_EMBED_TOKENIZER` | inside the model dir | | Point at either file directly. |
-| `DEN_EMBED_IDLE_UNLOAD_SEC` | 0 | 0–86400 | Unload the model after this long idle; 0 keeps it loaded. |
-| `DEN_EMBED_MAX_CHARS` | 8000 | 500–100000 | Per-text character cut. |
-| `DEN_EMBED_MAX_TOKENS` | 512 | 16–1024 | Per-text token cap. Changing it changes the vector of anything longer. |
-| `DEN_EMBED_MAX_REQUEST_TOKENS` | 8192 | 512–12288 | Total tokens per request. |
-| `DEN_EMBED_MAX_BATCH` | 512 | 1–4096 | Texts per batch. A rejection threshold, not a micro-batch. |
-| `DEN_EMBED_MAX_BODY_BYTES` | 4 MiB | 64 KiB–16 MiB | Request body limit. |
-| `DEN_EMBED_CACHE_MAX` | 8192 | 0–32768 | Cached vectors (~4.2 KB each); 0 turns the cache off. |
-| `DEN_EMBED_INTRA_THREADS` | 0 | 0–256 | ONNX Runtime intra-op threads; 0 uses all cores. |
-| `DEN_EMBED_DRAIN_GRACE_SEC` | 8 | 1–9 | How long a SIGTERM waits for in-flight requests. |
+| `MODEL_DIR` | `/models` | | Directory holding `model_int8.onnx` and `tokenizer.json`. |
+| `ONNX_PATH`, `TOKENIZER_PATH` | inside the model dir | | Point at either file directly. |
+| `IDLE_UNLOAD_SECS` | 0 | 0–86400 | Unload the model after this long idle; 0 keeps it loaded. |
+| `MAX_CHARS` | 8000 | 500–100000 | Per-text character cut. |
+| `MAX_TOKENS` | 512 | 16–1024 | Per-text token cap. Changing it changes the vector of anything longer. |
+| `MAX_REQUEST_TOKENS` | 8192 | 512–12288 | Total tokens per request. |
+| `MAX_BATCH` | 512 | 1–4096 | Texts per batch. A rejection threshold, not a micro-batch. |
+| `MAX_BODY_BYTES` | 4 MiB | 64 KiB–16 MiB | Request body limit. |
+| `CACHE_MAX_ENTRIES` | 8192 | 0–32768 | Cached vectors (~4.2 KB each); 0 turns the cache off. |
+| `INTRA_THREADS` | 0 | 0–256 | ONNX Runtime intra-op threads; 0 uses all cores. |
+| `DRAIN_GRACE_SECS` | 8 | 1–9 | How long a SIGTERM waits for in-flight requests. |
 
 A number outside its range is clamped and a malformed one falls back to the default, each with a log
 line. The ranges are memory and latency bounds, sized against a 1536 MiB container and den-atlas's
@@ -69,7 +69,7 @@ line. The ranges are memory and latency bounds, sized against a 1536 MiB contain
 
 ## Idle unload
 
-With `DEN_EMBED_IDLE_UNLOAD_SEC` above 0 (the box sets 600) the model is not loaded at boot. The first
+With `IDLE_UNLOAD_SECS` above 0 (the box sets 600) the model is not loaded at boot. The first
 request that needs it loads it, and a background task drops it after that many seconds without an
 inference, then hands the freed memory back to the OS. `/health` and `/metrics` do not count as
 activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at boot and
@@ -78,7 +78,7 @@ stays. Measured footprints for each state are in CLAUDE.md.
 ## Run and test
 
 ```sh
-DEN_EMBED_MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release
+MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release
 curl 'http://127.0.0.1:8080/embed?text=a%20heist%20thriller%20about%20a%20bank%20robbery'
 curl -X POST http://127.0.0.1:8080/embed/batch \
   -H 'content-type: application/json' \
@@ -89,7 +89,7 @@ Take the model files from the revision the Dockerfile pins, so local vectors mat
 
 ```sh
 cargo test
-DEN_EMBED_TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored   # the one test that needs the model
+TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored   # the one test that needs the model
 ```
 
 The unit tests pin the quantization, the cache key, the limits and `/metrics`; `tests/shutdown.rs`

@@ -61,8 +61,8 @@ COPY --from=build /src/target/release/den-embed /app/den-embed
 COPY --from=model /models /models
 
 ENV PORT=8080 \
-    DEN_EMBED_MODEL_DIR=/models \
-    DEN_EMBED_MAX_CHARS=8000 \
+    MODEL_DIR=/models \
+    MAX_CHARS=8000 \
     # Cap glibc's per-thread arenas so freed memory stays in few arenas that
     # malloc_trim (after idle-unload) can hand back to the OS.
     MALLOC_ARENA_MAX=2

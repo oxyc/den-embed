@@ -35,8 +35,7 @@ on the homelab box (`den/deploy/quadlet/den-embed.container`), reached by atlas 
 
 ## Limits: this service is sized for QUERIES, not documents
 
-`DEN_EMBED_MAX_TOKENS` (512) caps each text, and `DEN_EMBED_MAX_REQUEST_TOKENS` (8192) caps a whole
-request. Both are memory/latency bounds with measurements behind them, not guesses: peak RSS is
+`MAX_TOKENS` (512) caps each text, and `MAX_REQUEST_TOKENS` (8192) caps a whole request. Both are memory/latency bounds with measurements behind them, not guesses: peak RSS is
 1219 MB at 1024 tokens and 1598 MB at 2048 against a 1536 MB cgroup, and inference runs ~0.33 s per
 512 tokens while holding the model lock, so 8192 tokens is ~5 s — inside the 10 s timeout den-atlas
 puts on this call. Both are clamped, so no env value can raise them back into the failures they
@@ -63,7 +62,7 @@ Two earlier versions of this paragraph were wrong in both directions (first "~40
 restate this, verify it against `dataset.meta.json`'s builtAt versus den-dataset commit 8f93235
 rather than against whatever the defaults say today.
 
-`DEN_EMBED_MAX_BATCH` is NOT a server-side micro-batch — `embed_many` maps `embed_one` serially, so
+`MAX_BATCH` is NOT a server-side micro-batch — `embed_many` maps `embed_one` serially, so
 it bounds no memory at all. It is purely a rejection threshold (413 above it). Setting it low while
 sending larger requests is how that script was briefly unable to embed a single title.
 
@@ -97,7 +96,7 @@ trap: change behaviour, merge to main, see green tests, and assume it's live —
 what happened with idle-unload (committed in `bb41b71`, invisible on the box until `v1.2.0` was tagged).
 After any change you want running, cut the tag.
 
-## Idle-unload (`DEN_EMBED_IDLE_UNLOAD_SEC`, default 0 = always-warm)
+## Idle-unload (`IDLE_UNLOAD_SECS`, default 0 = always-warm)
 
 When `> 0` (the stack sets `600`): the model is **not** loaded at boot — it loads lazily on the first
 `/embed` (~1.3 s cold), and a background task drops it (session + tokenizer) after that many idle seconds,
