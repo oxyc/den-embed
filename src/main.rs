@@ -535,7 +535,16 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
+    // One plain line per event on stderr, the way every den addon logs. No timestamp, level or
+    // colour: the systemd journal stamps and names each line itself, and nothing filters on level
+    // (the build has no env-filter), so a prefix would only make these lines read unlike the rest.
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .without_time()
+        .with_level(false)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .init();
     // rc.13 returns bool, not Result: false means an environment was already committed, so this
     // config simply does not take effect. Nothing else in the process commits one, and there is no
     // failure to report — but say so rather than discard it silently.
@@ -578,13 +587,13 @@ async fn main() -> anyhow::Result<()> {
     // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
     let shutdown = shutdown_signal();
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    tracing::info!("den-embed listening on http://{addr} (port {bound})");
+    tracing::info!("listening on http://{addr} (port {bound})");
 
     let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
     match &outcome {
-        Outcome::Drained => tracing::info!("den-embed: shut down cleanly"),
-        Outcome::DeadlineHit(why) => tracing::warn!("den-embed: {why}"),
-        Outcome::Failed(why) => tracing::error!("den-embed: {why}"),
+        Outcome::Drained => tracing::info!("shut down cleanly"),
+        Outcome::DeadlineHit(why) => tracing::warn!("{why}"),
+        Outcome::Failed(why) => tracing::error!("{why}"),
     }
     // EXIT, rather than returning. Returning drops the tokio runtime, and dropping a runtime blocks
     // until every in-flight `spawn_blocking` finishes — which is where all inference runs. So the
@@ -608,8 +617,9 @@ async fn main() -> anyhow::Result<()> {
 /// under a running Run — a use-after-free-shaped race that happened to surface as a status. The same
 /// measurement with `_exit` produced it 0 times in 6.
 ///
-/// Nothing here needs an atexit handler: the model is read-only, the cache is in-memory, and stdout
-/// is line-buffered so the log lines are already out. It is flushed anyway, because `_exit` will not.
+/// Nothing here needs an atexit handler: the model is read-only, the cache is in-memory, and the log
+/// goes to stderr, which is unbuffered, so its lines are already out. Both streams are flushed anyway,
+/// because `_exit` will not.
 fn exit_now(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -750,7 +760,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 _ = quietly(signal(SignalKind::terminate())) => {}
                 _ = quietly(signal(SignalKind::interrupt())) => {}
             }
-            tracing::warn!("den-embed: second signal — exiting without finishing the drain");
+            tracing::warn!("second signal — exiting without finishing the drain");
             // `exit_now`, for the same reason as the deadline path — and this is where the hazard is
             // MOST likely, because you press ^C again precisely when inference is holding the drain
             // open. Measured with `process::exit`: 3 of 3 second-signal stops logged a bogus ORT
@@ -767,10 +777,10 @@ async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name
     match registered {
         Ok(mut sig) => {
             sig.recv().await;
-            tracing::info!("den-embed: {name} — draining in-flight requests");
+            tracing::info!("{name} — draining in-flight requests");
         }
         Err(e) => {
-            tracing::error!("den-embed: {name} handler unavailable ({e}); it will be a hard kill");
+            tracing::error!("{name} handler unavailable ({e}); it will be a hard kill");
             std::future::pending::<()>().await
         }
     }

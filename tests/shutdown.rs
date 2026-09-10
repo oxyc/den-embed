@@ -73,17 +73,17 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
         // Lazy-load, so no model file is ever opened.
         .env("DEN_EMBED_IDLE_UNLOAD_SEC", "1")
         .env("DEN_EMBED_MODEL_DIR", "/nonexistent-on-purpose")
-        // tracing_subscriber::fmt() writes to STDOUT, so that is where the readiness line is.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // The log, readiness line included, goes to STDERR.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     // AFTER the defaults, so a caller's override wins rather than being silently replaced.
     for (k, v) in extra {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("the binary must start");
 
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = BufReader::new(stderr);
     let mut port = None;
     let mut seen = String::new();
     for _ in 0..20 {
@@ -98,7 +98,7 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
         }
     }
     let port: u16 = port.expect("the binary never reported a listening port");
-    // Keep draining stdout so the pipe cannot fill and block the child, and keep what it said.
+    // Keep draining stderr so the pipe cannot fill and block the child, and keep what it said.
     let log: Log = std::sync::Arc::new(std::sync::Mutex::new(seen));
     let sink = log.clone();
     let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -109,7 +109,7 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
             sink.lock().unwrap().push_str(&line);
             line.clear();
         }
-        // EOF: the child closed stdout, so everything it ever wrote is now in the buffer.
+        // EOF: the child closed stderr, so everything it ever wrote is now in the buffer.
         done.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     DRAINED.lock().unwrap().push(drained);
@@ -120,7 +120,7 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
 static DRAINED: std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
     std::sync::Mutex::new(Vec::new());
 
-/// The server's full output, once its stdout has actually reached EOF.
+/// The server's full output, once its stderr has actually reached EOF.
 ///
 /// Reading the buffer straight after `wait_within` races the draining thread: the last line is
 /// written microseconds before `_exit` while the poll interval is 25ms, so under load the assertion
@@ -316,13 +316,13 @@ fn inference_in_flight_does_not_extend_the_stop() {
         .env("DEN_EMBED_DRAIN_GRACE_SEC", "2")
         // ~32000 tokens of genuinely dense work, so the batch is still running well past the grace.
         .env("DEN_EMBED_MAX_REQUEST_TOKENS", "32768")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the binary must start");
 
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = BufReader::new(stderr);
     let mut port = None;
     for _ in 0..40 {
         let mut line = String::new();
