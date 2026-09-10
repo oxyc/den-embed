@@ -136,18 +136,15 @@ impl Config {
         // Model files are baked into the image (see Dockerfile). Default to the
         // fixed bake paths; overridable for local dev.
         let model_dir = std::env::var("DEN_EMBED_MODEL_DIR").unwrap_or_else(|_| "/models".into());
-        let onnx_path = std::env::var("DEN_EMBED_ONNX")
-            .unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
-        let tokenizer_path = std::env::var("DEN_EMBED_TOKENIZER")
-            .unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
+        let onnx_path =
+            std::env::var("DEN_EMBED_ONNX").unwrap_or_else(|_| format!("{model_dir}/model_int8.onnx"));
+        let tokenizer_path =
+            std::env::var("DEN_EMBED_TOKENIZER").unwrap_or_else(|_| format!("{model_dir}/tokenizer.json"));
         // A day is already far past "idle"; anything larger is a typo.
         let idle = env_clamped("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0, 86_400);
         Self {
             host: std::env::var("DEN_EMBED_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("DEN_EMBED_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
+            port: std::env::var("DEN_EMBED_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
             onnx_path,
             tokenizer_path,
             max_chars: env_clamped("DEN_EMBED_MAX_CHARS", 8000, 500, 100_000),
@@ -160,7 +157,12 @@ impl Config {
             // 12288 is ~7.9s, the largest batch a caller is actually still waiting for.
             max_request_tokens: env_clamped("DEN_EMBED_MAX_REQUEST_TOKENS", 8192, 512, 12_288),
             max_batch: env_clamped("DEN_EMBED_MAX_BATCH", 512, 1, 4096),
-            max_body_bytes: env_clamped("DEN_EMBED_MAX_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+            max_body_bytes: env_clamped(
+                "DEN_EMBED_MAX_BODY_BYTES",
+                4 * 1024 * 1024,
+                64 * 1024,
+                16 * 1024 * 1024,
+            ),
             // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
             // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
             // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
@@ -189,8 +191,7 @@ impl Model {
             builder = builder.with_intra_threads(cfg.intra_threads).map_err(ort_err)?;
         }
         let session = builder.commit_from_file(&cfg.onnx_path).map_err(ort_err)?;
-        let mut tokenizer =
-            Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut tokenizer = Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
         // bge-m3 supports 8192 tokens, but the ceiling that matters here is memory, not the model:
         // see `Config::max_tokens`. The tokenizer.json ships no truncation, so this is where the cap
         // is actually enforced — `max_chars` does not bound tokens for non-Latin text.
@@ -213,8 +214,7 @@ struct AppState {
 
 impl AppState {
     fn touch(&self) {
-        self.last_used_ms
-            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_used_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 }
 
@@ -250,12 +250,7 @@ impl Lru {
         self.tick += 1;
         self.map.insert(key, (val, self.tick));
         while self.map.len() > self.cap {
-            if let Some(oldest) = self
-                .map
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| k.clone())
-            {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
                 self.map.remove(&oldest);
             } else {
                 break;
@@ -295,9 +290,7 @@ fn quantize_int8(cls: &[f32]) -> Vec<i32> {
             *x /= norm;
         }
     }
-    v.iter()
-        .map(|&x| ((x * 127.0).round_ties_even() as i64).clamp(-127, 127) as i32)
-        .collect()
+    v.iter().map(|&x| ((x * 127.0).round_ties_even() as i64).clamp(-127, 127) as i32).collect()
 }
 
 /// Run the model on one already-truncated, non-blank text → CLS-pooled int8 vector.
@@ -310,23 +303,16 @@ fn infer(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
     }
     let model = guard.as_mut().unwrap();
 
-    let enc = model
-        .tokenizer
-        .encode(text, true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
     let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
     let seq = ids.len();
 
     let ids = Tensor::from_array(Array2::from_shape_vec((1, seq), ids)?).map_err(ort_err)?;
     let mask = Tensor::from_array(Array2::from_shape_vec((1, seq), mask)?).map_err(ort_err)?;
-    let outputs = model
-        .session
-        .run(ort::inputs!["input_ids" => ids, "attention_mask" => mask])
-        .map_err(ort_err)?;
-    let (_shape, data) = outputs["last_hidden_state"]
-        .try_extract_tensor::<f32>()
-        .map_err(ort_err)?;
+    let outputs =
+        model.session.run(ort::inputs!["input_ids" => ids, "attention_mask" => mask]).map_err(ort_err)?;
+    let (_shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>().map_err(ort_err)?;
     // last_hidden_state is [1, seq, 1024]; CLS pooling = token 0 = data[0..1024].
     let cls = &data[0..DIMS];
     let out = quantize_int8(cls);
@@ -443,10 +429,7 @@ type AppErr = (StatusCode, Json<ErrResp>);
 
 fn internal(e: anyhow::Error) -> AppErr {
     tracing::error!("embed error: {e:#}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrResp { detail: "embedding failed".into() }),
-    )
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrResp { detail: "embedding failed".into() }))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
@@ -464,11 +447,10 @@ async fn embed_get(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EmbedQuery>,
 ) -> Result<Json<EmbedResp>, AppErr> {
-    let vector =
-        tokio::task::spawn_blocking(move || embed_one(&state, &q.text))
-            .await
-            .map_err(|e| internal(e.into()))?
-            .map_err(internal)?;
+    let vector = tokio::task::spawn_blocking(move || embed_one(&state, &q.text))
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map_err(internal)?;
     Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -476,11 +458,10 @@ async fn embed_post(
     State(state): State<Arc<AppState>>,
     Json(body): Json<EmbedBody>,
 ) -> Result<Json<EmbedResp>, AppErr> {
-    let vector =
-        tokio::task::spawn_blocking(move || embed_one(&state, &body.text))
-            .await
-            .map_err(|e| internal(e.into()))?
-            .map_err(internal)?;
+    let vector = tokio::task::spawn_blocking(move || embed_one(&state, &body.text))
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map_err(internal)?;
     Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -491,9 +472,7 @@ async fn embed_batch(
     if body.texts.len() > state.cfg.max_batch {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(ErrResp {
-                detail: format!("too many texts (max {})", state.cfg.max_batch),
-            }),
+            Json(ErrResp { detail: format!("too many texts (max {})", state.cfg.max_batch) }),
         ));
     }
     // Bound the TOTAL work, not just the count. Each text is separately capped, but the aggregate is
@@ -522,11 +501,10 @@ async fn embed_batch(
             }),
         ));
     }
-    let vectors =
-        tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
-            .await
-            .map_err(|e| internal(e.into()))?
-            .map_err(internal)?;
+    let vectors = tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map_err(internal)?;
     Ok(Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -543,8 +521,8 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
             let mut guard = state.model.lock().unwrap();
             if guard.is_some() && now_ms.saturating_sub(last) >= idle_ms {
                 *guard = None; // drops Session + Tokenizer → frees to the allocator
-                // ...but glibc keeps freed arenas mapped; hand them back to the OS so
-                // idle RSS actually falls (else it plateaus ~600 MB after unload).
+                               // ...but glibc keeps freed arenas mapped; hand them back to the OS so
+                               // idle RSS actually falls (else it plateaus ~600 MB after unload).
                 unsafe {
                     malloc_trim(0);
                 }
@@ -937,7 +915,11 @@ mod tests {
         std::env::set_var("DEN_EMBED_TEST_MALFORMED", "-5");
         assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 600);
         std::env::set_var("DEN_EMBED_TEST_MALFORMED", " 42 ");
-        assert_eq!(env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400), 42, "a padded number is still a number");
+        assert_eq!(
+            env_clamped("DEN_EMBED_TEST_MALFORMED", 600, 0, 86_400),
+            42,
+            "a padded number is still a number"
+        );
         std::env::remove_var("DEN_EMBED_TEST_MALFORMED");
     }
 

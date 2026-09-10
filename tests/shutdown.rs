@@ -374,7 +374,8 @@ fn inference_in_flight_does_not_extend_the_stop() {
     };
     let texts: Vec<String> = (0..64)
         .map(|i| {
-            let body: String = (0..500).map(|_| char::from_u32(0xAC00 + (next() % 11172) as u32).unwrap()).collect();
+            let body: String =
+                (0..500).map(|_| char::from_u32(0xAC00 + (next() % 11172) as u32).unwrap()).collect();
             format!("{body}{i}")
         })
         .collect();
