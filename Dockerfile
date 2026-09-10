@@ -52,8 +52,10 @@ RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
 FROM debian:trixie-slim
 WORKDIR /app
 
-# ONNX Runtime's OpenMP runtime dep. No shell tools on the health path.
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+# ONNX Runtime's OpenMP runtime dep. No shell tools on the health path. `upgrade` first: the slim base is
+# refreshed only every few weeks, so every build (the weekly patch rebuild included) takes the current
+# Debian security fixes rather than the base's.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Static ORT → the runtime just needs the self-contained binary + the baked model.

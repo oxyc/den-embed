@@ -117,3 +117,19 @@ repo's `deploy/README.md`. It is internal-only: no published port, reached by de
 `http://den-embed:8080` on `den.network`, capped at 1536 MiB, running as uid 65532 with the model
 baked into the image. Images publish on a `v*` tag, and `den-update` picks up the new `:latest`
 within a day, proving it by embedding a string before pinning its digest.
+
+**Release images.** `docker-publish` also runs every Monday: it rebuilds the newest `v*` tag (never
+`main`) with the base images re-pulled, no build cache and a fresh `apt-get upgrade`, and publishes it as
+`:X.Y.Z-patch.<date>.<run>` and `:latest`, so a Debian security fix reaches the box between releases
+through the same probe and rollback. The model is pinned by revision and checksum, so a rebuild bakes the
+same bytes. Trivy scans each image before `:latest` moves: a CRITICAL with a fix available fails the run
+(on the weekly rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL
+findings go to code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every
+image carries SLSA provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/oxyc/den-embed/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/oxyc/den-embed@sha256:<digest>
+```
