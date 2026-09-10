@@ -310,7 +310,8 @@ fn inference_in_flight_does_not_extend_the_stop() {
         // A SHORT grace, so the deadline fires well before the batch finishes. At the 8s default the
         // batch completed first, the deadline never fired, and the test passed against the bug.
         .env("DRAIN_GRACE_SECS", "2")
-        // ~32000 tokens of genuinely dense work, so the batch is still running well past the grace.
+        // Clamped to the 12288 ceiling, which still admits this batch whole: measured 7.35s of work
+        // on an M-series laptop, so it is still running well past the grace.
         .env("MAX_REQUEST_TOKENS", "32768")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
