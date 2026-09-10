@@ -3,9 +3,20 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # docker-publish.yml calls this as its gate, so a tag cannot publish an image CI would reject.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
@@ -13,24 +24,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # Contract unit tests (quantize / cache-key / blank handling). ort downloads
-      # ONNX Runtime during the build; the unit tests don't touch the model. The
-      # end-to-end byte-parity gate (tests/parity_check.py) is run manually against
-      # a live instance + golden vectors, not in CI.
-      - run: cargo test --locked
+
+      - name: Formatting
+        run: cargo fmt --check
 
       # Denied, not reported. This is not style policing: a working tree once had the entire
       # shutdown path dead — `main` still called plain `axum::serve`, so SIGTERM was caught and
       # discarded and the process could only be killed with SIGKILL. Three clippy lines named it
       # (unused variable `shutdown`, variants never constructed, function never used) and nothing in
       # CI was running them.
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-  # The image is what actually ships, and it builds differently from `cargo build` (musl-free debian,
-  # static ORT, a 555 MB model fetch). Catching a Dockerfile break here rather than at `git tag` time,
-  # WITHOUT pushing — the release job below is still the only thing that publishes.
-  image-builds:
+      # Contract unit tests (quantize / cache-key / blank handling). ort downloads
+      # ONNX Runtime during the build; the unit tests don't touch the model. The
+      # end-to-end byte-parity gate (tests/parity_check.py) is run manually against
+      # a live instance + golden vectors, not in CI.
+      - name: Tests
+        run: cargo test --locked
+
+  # The image is what actually ships, and it builds differently from `cargo build` (debian trixie,
+  # static ORT, a 555 MB model fetch). Catching a Dockerfile break on the PR rather than at `git tag`
+  # time, without pushing, for amd64 — the only arch the box runs. A tag's publish job builds it anyway.
+  build-pr:
+    needs: test
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,32 +60,6 @@ jobs:
         with:
           context: .
           push: false
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  image:
-    # Build + push the model-baked image ONLY on a v* tag (a deliberate release) or a manual run — NOT
-    # every main push. Tests still run on push/PR; the box updates only when you cut a tag. Matches the
-    # other addons.
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
