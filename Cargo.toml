@@ -4,6 +4,7 @@ version = "5.0.0"
 edition = "2021"
 description = "bge-m3 int8 embedding service for den-atlas semantic search (Rust rewrite of the Python service)"
 license = "MIT"
+publish = false
 
 [[bin]]
 name = "den-embed"
@@ -17,7 +18,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# Unwinding, not abort: a panic on the blocking pool then surfaces as a JoinError — the logged 500 —
+# instead of taking every in-flight request down with the process.
 
 [dependencies]
 # ONNX Runtime — the SAME native engine the Python service used via fastembed, so

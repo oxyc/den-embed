@@ -16,15 +16,15 @@
 //! actual output.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::extract::{Query, Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE,
+    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -184,8 +184,8 @@ impl Config {
                 .ok()
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),
-            // Unset, empty or "0" is off; anything else is on.
-            log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !matches!(v.trim(), "" | "0")),
+            // Unset, empty or "0" is off; anything else is on. Untrimmed, as in every den addon.
+            log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !matches!(v.as_str(), "" | "0")),
         }
     }
 }
@@ -235,11 +235,13 @@ impl std::fmt::Display for LoadFailed {
 fn ensure_loaded<'a>(
     slot: &'a mut Option<Model>,
     cfg: &Config,
+    load_failing: &AtomicBool,
     phases: &mut Phases,
 ) -> anyhow::Result<&'a mut Model> {
     if slot.is_none() {
         let started = Instant::now();
         *slot = Some(Model::load(cfg).context(LoadFailed)?);
+        load_failing.store(false, Ordering::Relaxed);
         Phases::add(&mut phases.load, started);
     }
     Ok(slot.as_mut().unwrap())
@@ -290,12 +292,22 @@ struct AppState {
     cache: Mutex<Lru>,
     /// When each failure condition was last logged, and how many repeats have gone unlogged since.
     failures: Mutex<HashMap<&'static str, (Option<Instant>, u64)>>,
+    /// The last attempt to load the model failed and none has succeeded since — what `/health`
+    /// reports as degraded, without itself ever loading the model.
+    load_failing: AtomicBool,
 }
 
 impl AppState {
     fn touch(&self) {
         self.last_used_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
+}
+
+/// Lock, recovering from poison. A panic while a lock is held (on the blocking pool, say) must cost
+/// that one request, not turn every later `unwrap` into another panic: the model is only read, the
+/// cache is a pure optimisation and the failure log is bookkeeping, so none of them is left unsafe.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // --- tiny LRU: cache is a pure optimization, so its eviction policy does not
@@ -377,8 +389,8 @@ fn quantize_int8(cls: &[f32]) -> Vec<i32> {
 /// Serialized under the model lock (single-worker, like the Python service), which
 /// also lazily loads the model on first use and refreshes the idle timer.
 fn infer(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
-    let mut guard = state.model.lock().unwrap();
-    let model = ensure_loaded(&mut guard, &state.cfg, phases)?;
+    let mut guard = lock(&state.model);
+    let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
 
     let started = Instant::now();
     let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -409,12 +421,12 @@ fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Resul
     }
     let truncated: String = text.chars().take(state.cfg.max_chars).collect();
     let key = cache_key(&truncated);
-    if let Some(hit) = state.cache.lock().unwrap().get(&key) {
+    if let Some(hit) = lock(&state.cache).get(&key) {
         phases.cache_hits += 1;
         return Ok(hit);
     }
     let vector = infer(state, &truncated, phases)?;
-    state.cache.lock().unwrap().put(key, vector.clone());
+    lock(&state.cache).put(key, vector.clone());
     Ok(vector)
 }
 
@@ -437,8 +449,8 @@ fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow
 /// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
 /// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
 fn count_tokens(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<usize> {
-    let mut guard = state.model.lock().unwrap();
-    let model = ensure_loaded(&mut guard, &state.cfg, phases)?;
+    let mut guard = lock(&state.model);
+    let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
     let mut total = 0usize;
     for t in texts {
         if is_blank(t) {
@@ -456,9 +468,15 @@ fn count_tokens(state: &AppState, texts: &[String], phases: &mut Phases) -> anyh
 
 // --- HTTP surface (same routes/shapes as server.py) ------------------------
 
+/// The den addon health shape — `status`, plus `reason` and `detail` only when degraded — followed by
+/// the embedder identity den-dataset reads.
 #[derive(Serialize)]
 struct HealthResp {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'static str>,
     model: &'static str,
     dims: usize,
     /// Which generation of vectors this serves — see `VECTOR_EPOCH`. This, `dims` and `max_tokens` are
@@ -502,9 +520,12 @@ struct BatchBody {
     texts: Vec<String>,
 }
 
+/// `{"error":"<slug>"[,"detail":"…"]}`, the error body every den addon answers with.
 #[derive(Serialize)]
 struct ErrResp {
-    detail: String,
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 type AppErr = (StatusCode, Json<ErrResp>);
@@ -517,11 +538,14 @@ const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
 /// being embedded never does.
 fn internal(state: &AppState, e: anyhow::Error) -> AppErr {
     let (condition, detail) = match e.downcast_ref::<LoadFailed>() {
-        Some(_) => ("model load", format!("{:#}", e.root_cause())),
+        Some(_) => {
+            state.load_failing.store(true, Ordering::Relaxed);
+            ("model load", format!("{:#}", e.root_cause()))
+        }
         None => ("embedding", format!("{e:#}")),
     };
     let now = Instant::now();
-    let mut failures = state.failures.lock().unwrap();
+    let mut failures = lock(&state.failures);
     let (last, repeats) = failures.entry(condition).or_insert((None, 0));
     if last.is_some_and(|at| now.duration_since(at) < FAILURE_LOG_EVERY) {
         *repeats += 1;
@@ -532,7 +556,7 @@ fn internal(state: &AppState, e: anyhow::Error) -> AppErr {
             n => tracing::error!("{condition} failed: {detail} ({n} more since the last line)"),
         }
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrResp { detail: "embedding failed".into() }))
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrResp { error: "embedding_failed", detail: None }))
 }
 
 /// Run `f` on the blocking pool, where all tokenizing and inference happens, turning any failure
@@ -549,9 +573,14 @@ async fn run_blocking<T: Send + 'static>(
     }
 }
 
+/// Always 200 — liveness never fails; the body carries the state. Never loads the model: a degraded
+/// answer comes from the last load that was actually attempted by an embed.
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
+    let failing = state.load_failing.load(Ordering::Relaxed);
     Json(HealthResp {
-        status: "ok",
+        status: if failing { "degraded" } else { "ok" },
+        reason: failing.then_some("model_unavailable"),
+        detail: failing.then_some("the model could not be loaded; embeds fail until it can"),
         model: MODEL_LABEL,
         dims: DIMS,
         vector_epoch: VECTOR_EPOCH,
@@ -608,7 +637,10 @@ async fn cors(req: Request, next: Next) -> Response {
         )
             .into_response();
     }
-    let mut resp = next.run(req).await;
+    let mut resp = json_error(next.run(req).await).await;
+    // Nothing here is worth a cache holding: health is live state, a vector is cheap to recompute and
+    // cached in-process already, and errors must never stick.
+    resp.headers_mut().entry(CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
@@ -616,6 +648,38 @@ async fn cors(req: Request, next: Next) -> Response {
         .insert("access-control-expose-headers", HeaderValue::from_static("Server-Timing, X-Den-Degraded"));
     resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     resp
+}
+
+/// Errors axum makes itself — an extractor rejection (bad or missing JSON, a bad query), a 405, a body
+/// over the limit — come back as plain text or empty. Every den addon answers
+/// `{"error":"<slug>"[,"detail":"…"]}` instead, so rewrite any non-JSON error into that, keeping the
+/// status and the framework's message as the detail.
+async fn json_error(resp: Response) -> Response {
+    let status = resp.status();
+    let is_json =
+        resp.headers().get(CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return resp;
+    }
+    let slug = match status {
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        s if s.is_client_error() => "bad_request",
+        _ => "internal_error",
+    };
+    let (mut parts, body) = resp.into_parts();
+    // Rejection messages are one short line; the cap only bounds what an unexpected body could be.
+    let text = axum::body::to_bytes(body, 4096)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
+        .unwrap_or_default();
+    let mut value = serde_json::json!({ "error": slug });
+    if !text.is_empty() {
+        value["detail"] = text.into();
+    }
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Response::from_parts(parts, axum::body::Body::from(value.to_string()))
 }
 
 /// One line per request, written once the response is ready. Only added to the router when
@@ -636,9 +700,11 @@ fn request_line(method: &Method, uri: &Uri, status: StatusCode, took: Duration) 
 
 fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
     let Some(want) = want else { return false };
+    // The `Bearer ` scheme is required, as in every den addon: a bare token is not an Authorization
+    // value any client sends, so accepting one only made this addon the odd one out.
     let given = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let given = given.strip_prefix("Bearer ").unwrap_or(given).trim();
-    constant_time_eq(given.as_bytes(), want.as_bytes())
+    let Some(given) = given.strip_prefix("Bearer ") else { return false };
+    constant_time_eq(given.trim().as_bytes(), want.as_bytes())
 }
 
 /// Compare without stopping at the first differing byte, so response time does not reveal how much
@@ -659,7 +725,7 @@ fn render_metrics(state: &AppState) -> String {
         Err(TryLockError::Poisoned(p)) => p.into_inner().is_some(),
     };
     let (entries, capacity) = {
-        let cache = state.cache.lock().unwrap();
+        let cache = lock(&state.cache);
         (cache.map.len(), cache.cap)
     };
     // The same arithmetic the unloader does, so this is the number it compares against its limit.
@@ -677,9 +743,9 @@ embed_model_loaded {loaded}
 # HELP embed_cache_entries Vectors held in the embedding cache.
 # TYPE embed_cache_entries gauge
 embed_cache_entries {entries}
-# HELP embed_cache_capacity Most vectors the embedding cache will hold (0 = cache off).
-# TYPE embed_cache_capacity gauge
-embed_cache_capacity {capacity}
+# HELP embed_cache_max Most vectors the embedding cache will hold (0 = cache off).
+# TYPE embed_cache_max gauge
+embed_cache_max {capacity}
 # HELP embed_idle_seconds Seconds since the last inference, or since boot if there has been none.
 # TYPE embed_idle_seconds gauge
 embed_idle_seconds {idle_secs}
@@ -730,7 +796,10 @@ async fn embed_batch(
     if body.texts.len() > state.cfg.max_batch {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(ErrResp { detail: format!("too many texts (max {})", state.cfg.max_batch) }),
+            Json(ErrResp {
+                error: "too_many_texts",
+                detail: Some(format!("too many texts (max {})", state.cfg.max_batch)),
+            }),
         ));
     }
     // Bound the TOTAL work, not just the count. Each text is separately capped, but the aggregate is
@@ -751,11 +820,12 @@ async fn embed_batch(
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrResp {
-                detail: format!(
-                    "batch too large: {total} tokens across {} texts (max {} in total)",
+                error: "batch_too_large",
+                detail: Some(format!(
+                    "{total} tokens across {} texts (max {} in total)",
                     body.texts.len(),
                     state.cfg.max_request_tokens
-                ),
+                )),
             }),
         ));
     }
@@ -777,7 +847,7 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
             let idle_ms = idle.as_millis() as u64;
             let now_ms = state.started.elapsed().as_millis() as u64;
             let last = state.last_used_ms.load(Ordering::Relaxed);
-            let mut guard = state.model.lock().unwrap();
+            let mut guard = lock(&state.model);
             if guard.is_some() && now_ms.saturating_sub(last) >= idle_ms {
                 *guard = None; // drops Session + Tokenizer → frees to the allocator
                                // ...but glibc keeps freed arenas mapped; hand them back to the OS so
@@ -821,6 +891,7 @@ async fn main() -> anyhow::Result<()> {
         last_used_ms: AtomicU64::new(0),
         started: Instant::now(),
         failures: Mutex::new(HashMap::new()),
+        load_failing: AtomicBool::new(false),
         cfg,
     });
 
@@ -829,20 +900,19 @@ async fn main() -> anyhow::Result<()> {
         Some(d) => spawn_idle_unloader(state.clone(), d),
         // Always-warm: load at boot so the first request isn't cold.
         None => {
-            *state.model.lock().unwrap() = Some(Model::load(&state.cfg)?);
+            *lock(&state.model) = Some(Model::load(&state.cfg)?);
         }
     }
 
     // What this process is running with, secret-free: the metrics token is reported as on or off.
     let on_off = |on: bool| if on { "on" } else { "off" };
-    let summary = format!(
-        "den-embed {} ({MODEL_LABEL}, idle-unload {}, max_tokens {}, max_request_tokens {}, metrics {}, request log {})",
-        env!("CARGO_PKG_VERSION"),
+    let settings = format!(
+        "metrics={} log_requests={} model={MODEL_LABEL} idle_unload={} max_tokens={} max_request_tokens={}",
+        on_off(state.cfg.metrics_token.is_some()),
+        on_off(state.cfg.log_requests),
         state.cfg.idle_unload.map_or("off".into(), |d| format!("{}s", d.as_secs())),
         state.cfg.max_tokens,
         state.cfg.max_request_tokens,
-        on_off(state.cfg.metrics_token.is_some()),
-        on_off(state.cfg.log_requests),
     );
     let app = router(state);
 
@@ -850,9 +920,9 @@ async fn main() -> anyhow::Result<()> {
     // Registered BEFORE the readiness line, so nothing is told the service is up while a stop signal
     // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
     let shutdown = shutdown_signal();
+    // The BOUND port, not the configured one: tests/shutdown.rs starts on port 0 and reads it here.
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    // "(port N)" stays last: tests/shutdown.rs reads the bound port from the end of this line.
-    tracing::info!("{summary} listening on http://{addr} (port {bound})");
+    tracing::info!("den-embed {} listening on :{bound} — {settings}", env!("CARGO_PKG_VERSION"));
 
     let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
     match &outcome {
@@ -1091,6 +1161,8 @@ mod tests {
     fn health_reports_what_actually_embedded() {
         let body = serde_json::to_value(HealthResp {
             status: "ok",
+            reason: None,
+            detail: None,
             model: MODEL_LABEL,
             dims: DIMS,
             vector_epoch: VECTOR_EPOCH,
@@ -1225,8 +1297,125 @@ mod tests {
             last_used_ms: AtomicU64::new(0),
             started: Instant::now() - Duration::from_secs(60),
             failures: Mutex::new(HashMap::new()),
+            load_failing: AtomicBool::new(false),
             cfg,
         })
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
+    }
+
+    async fn send(
+        state: Arc<AppState>,
+        method: Method,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+    ) -> Response {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    /// Nothing this service answers is worth a cache holding, and a response that says nothing
+    /// is heuristically cacheable — so every one says no-store, successes included.
+    #[tokio::test]
+    async fn every_response_is_no_store() {
+        for (method, path) in
+            [(Method::GET, "/health"), (Method::GET, "/embed?text="), (Method::DELETE, "/health")]
+        {
+            let resp = call(metrics_state(None), method.clone(), path).await;
+            assert_eq!(header(&resp, "cache-control"), "no-store", "{method} {path}");
+        }
+    }
+
+    /// Framework rejections answer in the den error shape, not axum's plain text or empty body.
+    #[tokio::test]
+    async fn framework_errors_are_json() {
+        let state = metrics_state(None);
+        let cases = [
+            (
+                send(state.clone(), Method::DELETE, "/health", "text/plain", "").await,
+                405,
+                "method_not_allowed",
+            ),
+            (
+                send(state.clone(), Method::POST, "/embed", "application/json", "{not json").await,
+                400,
+                "bad_request",
+            ),
+            (
+                send(state.clone(), Method::POST, "/embed/batch", "application/json", "{}").await,
+                422,
+                "bad_request",
+            ),
+        ];
+        for (resp, status, slug) in cases {
+            assert_eq!(resp.status().as_u16(), status, "{slug}");
+            assert_eq!(header(&resp, "content-type"), "application/json", "{slug}");
+            assert_eq!(header(&resp, "cache-control"), "no-store", "{slug}");
+            let body = body_json(resp).await;
+            assert_eq!(body["error"], slug, "{body}");
+        }
+    }
+
+    /// A batch over the limit names itself, with the numbers in `detail`.
+    #[tokio::test]
+    async fn an_oversized_batch_is_a_typed_413() {
+        let mut cfg = Config::from_env();
+        cfg.max_batch = 1;
+        let state = metrics_state(None);
+        let state = Arc::new(AppState {
+            cache: Mutex::new(Lru::new(0)),
+            model: Mutex::new(None),
+            last_used_ms: AtomicU64::new(0),
+            started: state.started,
+            failures: Mutex::new(HashMap::new()),
+            load_failing: AtomicBool::new(false),
+            cfg,
+        });
+        let resp =
+            send(state, Method::POST, "/embed/batch", "application/json", r#"{"texts":["a","b"]}"#).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "too_many_texts");
+        assert!(body["detail"].as_str().unwrap().contains("max 1"), "{body}");
+    }
+
+    /// A model that cannot load is a typed 500 AND a degraded /health — which never loads the model
+    /// itself, so it reports what the last real attempt found. The test's model path does not exist.
+    #[tokio::test]
+    async fn a_model_that_will_not_load_degrades_health() {
+        let state = metrics_state(None);
+        let healthy = body_json(call(state.clone(), Method::GET, "/health").await).await;
+        assert_eq!(healthy["status"], "ok");
+        assert!(healthy.get("reason").is_none(), "{healthy}");
+
+        let resp = call(state.clone(), Method::GET, "/embed?text=hola").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await, serde_json::json!({ "error": "embedding_failed" }));
+
+        let health = body_json(call(state, Method::GET, "/health").await).await;
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "model_unavailable");
+        assert!(health["detail"].is_string(), "{health}");
+        assert_eq!(health["model"], MODEL_LABEL, "the identity fields must survive a degraded answer");
+    }
+
+    /// A bare token is not an Authorization value; every den addon requires the scheme.
+    #[tokio::test]
+    async fn metrics_requires_the_bearer_scheme() {
+        let (status, _, _) = scrape(metrics_state(Some("s3cret")), Some("s3cret")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = scrape(metrics_state(Some("s3cret")), Some("Bearer  s3cret ")).await;
+        assert_eq!(status, StatusCode::OK, "the token is trimmed after the scheme");
     }
 
     /// `GET /embed?text=` carries the user's search in the query, so the line has the path alone.
@@ -1288,7 +1477,7 @@ mod tests {
             assert_eq!(header(&resp, "access-control-max-age"), "86400", "{path}");
         }
         assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "a preflight reset the idle clock");
-        assert!(state.model.lock().unwrap().is_none(), "a preflight loaded the model");
+        assert!(lock(&state.model).is_none(), "a preflight loaded the model");
     }
 
     /// Success, a refused route, an unknown path and a wrong method alike: a response without the
@@ -1371,7 +1560,7 @@ mod tests {
         let (_, _, body) = scrape(state.clone(), Some("Bearer s3cret")).await;
 
         assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "the scrape reset the idle clock");
-        assert!(state.model.lock().unwrap().is_none(), "the scrape loaded the model");
+        assert!(lock(&state.model).is_none(), "the scrape loaded the model");
         assert!(body.contains("\nembed_model_loaded 0\n"), "{body}");
         let idle: u64 = body
             .lines()

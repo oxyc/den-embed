@@ -48,6 +48,11 @@ fn signal(child: &Child, sig: i32) {
 /// Everything the server printed, shared with the draining thread.
 type Log = std::sync::Arc<std::sync::Mutex<String>>;
 
+/// The bound port from the readiness line, `den-embed <version> listening on :<port> — …`.
+fn listening_port(line: &str) -> Option<u16> {
+    line.split("listening on :").nth(1)?.split_whitespace().next()?.parse().ok()
+}
+
 /// Start den-embed on an ephemeral port and wait until it reports the port it bound.
 fn start() -> (Child, u16) {
     let (c, p, _) = start_logged(&[]);
@@ -88,8 +93,8 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
             break;
         }
         seen.push_str(&line);
-        if let Some(rest) = line.split("(port ").nth(1) {
-            port = rest.trim_end().trim_end_matches(')').parse().ok();
+        if let Some(p) = listening_port(&line) {
+            port = Some(p);
             break;
         }
     }
@@ -326,8 +331,8 @@ fn inference_in_flight_does_not_extend_the_stop() {
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             break;
         }
-        if let Some(rest) = line.split("(port ").nth(1) {
-            port = rest.trim_end().trim_end_matches(')').parse::<u16>().ok();
+        if let Some(p) = listening_port(&line) {
+            port = Some(p);
             break;
         }
     }

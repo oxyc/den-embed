@@ -45,15 +45,19 @@ boot and stays. Measured footprints for each state are in CLAUDE.md.
 | POST | `/embed/batch` | `{"texts":["…","…"]}` | `{"vectors":[[…],…],"dims":1024,"model":"bge-m3"}` |
 | GET | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | Prometheus text (`embed_*` series) |
 
-- `/health` is constant and never loads the model, so it says `ok` even when the model is missing.
-  To prove the service can embed, embed something.
+- `/health` never loads the model. It says `ok` until an embed fails to load the model, then
+  `{"status":"degraded","reason":"model_unavailable","detail":"…", …}` until a load succeeds — so a
+  missing model shows only after something has tried to embed. The identity fields are always there.
 - An unknown path answers 404 `{"error":"not_found"}` (`application/json`, `no-store`), and so does
   `/metrics` when `METRICS_TOKEN` is unset or the token is wrong.
-- Every response carries `Access-Control-Allow-Origin: *`. `OPTIONS` on any path answers 204 with
-  the preflight headers and, like `/health` and `/metrics`, is not activity for idle unload.
-- 413 when a batch has more than `MAX_BATCH` texts or more than `MAX_REQUEST_TOKENS` tokens in
-  total, or a body exceeds `MAX_BODY_BYTES`.
-- 500 `{"detail":"embedding failed"}` when inference fails; the real error goes to the log.
+- Every response carries `Access-Control-Allow-Origin: *` and `Cache-Control: no-store`. `OPTIONS`
+  on any path answers 204 with the preflight headers and, like `/health` and `/metrics`, is not
+  activity for idle unload.
+- Errors are JSON, `{"error":"<slug>"[,"detail":"…"]}`, `no-store`:
+  - 413 `too_many_texts` / `batch_too_large` over `MAX_BATCH` texts or `MAX_REQUEST_TOKENS` tokens
+    in total; 413 `payload_too_large` for a body over `MAX_BODY_BYTES`.
+  - 400/422 `bad_request` for a malformed body or query, 405 `method_not_allowed`.
+  - 500 `embedding_failed` when inference fails; the real error goes to the log.
 - A successful `/embed` or `/embed/batch` carries `Server-Timing`, in milliseconds: `load` when this
   request had to load the model, `tokenize`, `inference` (or `cache;desc=hit` when every text came
   from the cache), then `total`.
