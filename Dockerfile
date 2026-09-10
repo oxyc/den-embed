@@ -68,5 +68,10 @@ ENV DEN_EMBED_HOST=0.0.0.0 \
     # malloc_trim (after idle-unload) can hand back to the OS.
     MALLOC_ARENA_MAX=2
 
+# Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532). Nothing here
+# writes to disk: the model is read from /models and the embedding cache lives in memory.
+RUN useradd --system --uid 65532 --user-group --no-create-home nonroot
+
 EXPOSE 8080
+USER 65532:65532
 ENTRYPOINT ["/app/den-embed"]
