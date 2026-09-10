@@ -1,6 +1,6 @@
 [package]
 name = "den-embed"
-version = "3.1.1"
+version = "4.0.0"
 edition = "2021"
 description = "bge-m3 int8 embedding service for den-atlas semantic search (Rust rewrite of the Python service)"
 license = "MIT"
