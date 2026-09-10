@@ -4,14 +4,16 @@
 //! a tiny idle footprint. The Python process, even with the model unloaded, held
 //! ~100 MB (interpreter + numpy + fastapi + onnxruntime arenas that gc can't
 //! return). This drops the interpreter entirely; with the model AND tokenizer
-//! idle-unloaded it idles at ~10-15 MB, reloading on the next request.
+//! idle-unloaded it falls back to tens of MB (measured figures in CLAUDE.md),
+//! reloading on the next request.
 //!
 //! Parity is the contract. Corpus vectors and query vectors are only comparable
 //! because they pass through ONE canonical path: same tokenizer.json (HuggingFace
 //! `tokenizers`, the very crate fastembed wraps), same model_int8.onnx on the same
 //! ONNX Runtime CPU provider (via `ort`), same CLS pooling, same L2-normalize, same
-//! `round(x*127)` clamp. The golden-vector test (tests/parity) pins this against
-//! the Python service's actual output.
+//! `round(x*127)` clamp. tests/parity_check.py — run by hand against a live
+//! instance and golden vectors, not in CI — pins this against the Python service's
+//! actual output.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -724,13 +726,14 @@ extern "C" {
 ///
 /// Configurable because it is coupled to the container's stop timeout, which is set outside this
 /// binary: raise one and you must raise the other. The default is what is safe with no stop timeout
-/// configured at all, which is how the quadlet currently runs.
+/// configured at all. The quadlet does set `--stop-timeout=25`, but that file only lands when someone
+/// re-runs the provisioner, and the drain must not depend on it having done so.
 ///
 /// The binary is PID 1 in its container (`ENTRYPOINT` exec form), and PID 1 gets no default
 /// terminate action — so without a handler SIGTERM was ignored entirely and podman waited its full
 /// stop timeout before SIGKILLing: a guaranteed ~10s of downtime on every deploy and auto-update,
-/// with every in-flight embed cut. Under podman's DEFAULT 10s, because the quadlet sets no
-/// stop-timeout of its own; an embed is milliseconds warm and ~1.3s cold, so this is generous.
+/// with every in-flight embed cut. Under podman's DEFAULT 10s rather than the quadlet's 25s, for the
+/// reason above; an embed is milliseconds warm and ~1.3s cold, so this is generous.
 const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
 
 // The default must finish before the smallest external stop timeout that can apply — podman's and

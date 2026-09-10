@@ -362,7 +362,8 @@ fn inference_in_flight_does_not_extend_the_stop() {
     //  - UNIQUE per text, because identical texts are content-cache hits — 16 identical texts is one
     //    inference and 15 lookups, which also finished in 0.3s.
     // At the default 8192-token budget the work tops out around 2.5s, too close to any grace worth
-    // testing, so the run below raises the budget (a supported setting, clamped at 32768).
+    // testing, so the run below raises the budget (a supported setting; the 32768 it asks for is
+    // clamped to the 12288 ceiling in env_clamped).
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut next = || {
         seed ^= seed << 13;
