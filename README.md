@@ -39,8 +39,10 @@ Vectors are cached in memory, keyed by content.
 
 - `/health` is constant and never loads the model, so it says `ok` even when the model is missing.
   To prove the service can embed, embed something.
-- `/metrics` answers a bare 404, like an unknown route, when `METRICS_TOKEN` is unset or the token is
-  wrong.
+- An unknown path answers 404 `{"error":"not_found"}` (`application/json`, `no-store`), and so does
+  `/metrics` when `METRICS_TOKEN` is unset or the token is wrong.
+- Every response carries `Access-Control-Allow-Origin: *`. `OPTIONS` on any path answers 204 with
+  the preflight headers and, like `/health` and `/metrics`, is not activity for idle unload.
 - 413 when a batch has more than `MAX_BATCH` texts or more than `MAX_REQUEST_TOKENS` tokens in
   total, or a body exceeds `MAX_BODY_BYTES`.
 - 500 `{"detail":"embedding failed"}` when inference fails; the real error goes to the log.

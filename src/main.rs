@@ -20,9 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Query, Request, State};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -451,8 +455,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
 
 /// `GET /metrics`: Prometheus text format, behind `Authorization: Bearer <METRICS_TOKEN>`.
 ///
-/// With no token configured, or the wrong one given, it answers exactly as an unknown route does — a
-/// bare 404 — so an install that has not set one is not told there is something here to poke at.
+/// With no token configured, or the wrong one given, it answers exactly as an unknown route does — the
+/// same JSON 404 — so an install that has not set one is not told there is something here to poke at.
 ///
 /// A scrape is NOT activity, for the same reason `/health` is not: a scraper polling every 15 seconds
 /// would otherwise keep ~1.2 GB resident all day, which is precisely what idle-unload exists to
@@ -460,13 +464,46 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// is state the service already keeps for its own purposes, computed here on request.
 async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !metrics_authorized(state.cfg.metrics_token.as_deref(), &headers) {
-        return StatusCode::NOT_FOUND.into_response();
+        return not_found();
     }
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")],
         render_metrics(&state),
     )
         .into_response()
+}
+
+/// The answer for an unknown path and for a refused `/metrics`, identical so the two cannot be told
+/// apart. The same body every den addon gives.
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(CONTENT_TYPE, "application/json"), (CACHE_CONTROL, "no-store")],
+        r#"{"error":"not_found"}"#,
+    )
+        .into_response()
+}
+
+/// Every response is readable cross-origin, and a preflight on any path is answered here, before
+/// routing. It returns without reaching a handler, so a preflight never calls `touch` or loads the
+/// model — like `/health` and `/metrics`, it is not activity and cannot keep the model warm.
+async fn cors(req: Request, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        return (
+            StatusCode::NO_CONTENT,
+            [
+                (ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS"),
+                (ACCESS_CONTROL_ALLOW_HEADERS, "*"),
+                // A day, so a browser stops preflighting every request.
+                (ACCESS_CONTROL_MAX_AGE, "86400"),
+            ],
+        )
+            .into_response();
+    }
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
 }
 
 fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
@@ -637,7 +674,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
     let addr = format!("0.0.0.0:{}", cfg.port);
-    let max_body = cfg.max_body_bytes;
     let idle = cfg.idle_unload;
     let cache_max = cfg.cache_max;
 
@@ -658,13 +694,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/embed", get(embed_get).post(embed_post))
-        .route("/embed/batch", post(embed_batch))
-        .layer(axum::extract::DefaultBodyLimit::max(max_body))
-        .with_state(state);
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // Registered BEFORE the readiness line, so nothing is told the service is up while a stop signal
@@ -689,6 +719,21 @@ async fn main() -> anyhow::Result<()> {
     // It also keeps the second-signal escape alive: that is a spawned task, and dropping the runtime
     // cancelled it exactly during the window an operator would be pressing ^C again.
     exit_now(outcome.exit_code());
+}
+
+/// The fallback and the CORS layer are added after the routes because a layer only wraps what the
+/// router already holds; added before, unknown paths and 405s would go out without the CORS header.
+fn router(state: Arc<AppState>) -> Router {
+    let max_body = state.cfg.max_body_bytes;
+    Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/embed", get(embed_get).post(embed_post))
+        .route("/embed/batch", post(embed_batch))
+        .fallback(|| async { not_found() })
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .layer(middleware::from_fn(cors))
+        .with_state(state)
 }
 
 /// Exit without running `atexit` handlers.
@@ -1047,10 +1092,67 @@ mod tests {
     #[tokio::test]
     async fn metrics_is_not_found_without_a_configured_token() {
         for auth in [None, Some("Bearer "), Some("Bearer anything")] {
-            let (status, _, body) = scrape(metrics_state(None), auth).await;
+            let (status, content_type, body) = scrape(metrics_state(None), auth).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "served metrics with no token configured ({auth:?})");
-            assert!(body.is_empty(), "a 404 that says something is not an unknown route: {body:?}");
+            assert_eq!(content_type, "application/json");
+            assert_eq!(body, r#"{"error":"not_found"}"#, "unlike an unknown route's 404");
         }
+    }
+
+    async fn call(state: Arc<AppState>, method: Method, uri: &str) -> Response {
+        use tower::ServiceExt;
+        let req =
+            axum::http::Request::builder().method(method).uri(uri).body(axum::body::Body::empty()).unwrap();
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    fn header<'a>(resp: &'a Response, name: &str) -> &'a str {
+        resp.headers().get(name).map(|v| v.to_str().unwrap()).unwrap_or_default()
+    }
+
+    /// A browser preflights any path it means to call, including ones with no OPTIONS route, and
+    /// answering one must not count as use: that would keep ~1.2 GB resident for anything that
+    /// preflights on a timer, which is what idle-unload exists to prevent.
+    #[tokio::test]
+    async fn a_preflight_on_any_path_is_answered_without_waking_the_model() {
+        let state = metrics_state(None);
+        for path in ["/embed", "/embed/batch", "/health", "/metrics", "/nope"] {
+            let resp = call(state.clone(), Method::OPTIONS, path).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{path}");
+            assert_eq!(header(&resp, "access-control-allow-methods"), "GET, HEAD, POST, OPTIONS", "{path}");
+            assert_eq!(header(&resp, "access-control-allow-headers"), "*", "{path}");
+            assert_eq!(header(&resp, "access-control-max-age"), "86400", "{path}");
+        }
+        assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "a preflight reset the idle clock");
+        assert!(state.model.lock().unwrap().is_none(), "a preflight loaded the model");
+    }
+
+    /// Success, a refused route, an unknown path and a wrong method alike: a response without the
+    /// header is unreadable to a browser, whatever its status says.
+    #[tokio::test]
+    async fn every_response_is_readable_cross_origin() {
+        for (method, path, status) in [
+            (Method::GET, "/health", StatusCode::OK),
+            (Method::GET, "/embed?text=", StatusCode::OK), // blank: a zero vector, no model needed
+            (Method::GET, "/metrics", StatusCode::NOT_FOUND),
+            (Method::GET, "/nope", StatusCode::NOT_FOUND),
+            (Method::DELETE, "/health", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let resp = call(metrics_state(None), method.clone(), path).await;
+            assert_eq!(resp.status(), status, "{method} {path}");
+            assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_path_is_a_json_404() {
+        let resp = call(metrics_state(None), Method::GET, "/nope").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&resp, "content-type"), "application/json");
+        assert_eq!(header(&resp, "cache-control"), "no-store");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"not_found"}"#);
     }
 
     #[tokio::test]

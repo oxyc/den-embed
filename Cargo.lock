@@ -294,6 +294,7 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

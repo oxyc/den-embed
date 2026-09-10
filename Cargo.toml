@@ -40,3 +40,7 @@ blake2 = "0.11"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[dev-dependencies]
+# `oneshot`, to drive the router in a unit test without binding a socket. Already in the tree via axum.
+tower = { version = "0.5", features = ["util"] }
