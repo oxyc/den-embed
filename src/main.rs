@@ -20,12 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use axum::extract::{Query, Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE,
 };
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -114,6 +115,8 @@ struct Config {
     intra_threads: usize,
     /// Bearer token for `/metrics`; `None` (unset or blank) turns the route off.
     metrics_token: Option<String>,
+    /// One stderr line per request. Read once here, so with it off the only cost is not adding the layer.
+    log_requests: bool,
 }
 
 /// Read a numeric env var, clamped to `[min, max]`.
@@ -181,6 +184,8 @@ impl Config {
                 .ok()
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),
+            // Unset, empty or "0" is off; anything else is on.
+            log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !matches!(v.trim(), "" | "0")),
         }
     }
 }
@@ -193,6 +198,7 @@ struct Model {
 
 impl Model {
     fn load(cfg: &Config) -> anyhow::Result<Self> {
+        let started = Instant::now();
         let mut builder = Session::builder()
             .map_err(ort_err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -209,8 +215,28 @@ impl Model {
             max_length: cfg.max_tokens,
             ..Default::default()
         }));
+        tracing::info!("loaded model in {}ms", started.elapsed().as_millis());
         Ok(Self { session, tokenizer })
     }
+}
+
+/// Marks a failure to load the model, so it is rate-limited apart from a failure of inference itself:
+/// a missing model fails every request, and its line must not stand in for a different failure.
+#[derive(Debug)]
+struct LoadFailed;
+
+impl std::fmt::Display for LoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model load failed")
+    }
+}
+
+/// The model, loaded first if it is not resident — never loaded yet, or dropped by idle-unload.
+fn ensure_loaded<'a>(slot: &'a mut Option<Model>, cfg: &Config) -> anyhow::Result<&'a mut Model> {
+    if slot.is_none() {
+        *slot = Some(Model::load(cfg).context(LoadFailed)?);
+    }
+    Ok(slot.as_mut().unwrap())
 }
 
 struct AppState {
@@ -220,6 +246,8 @@ struct AppState {
     last_used_ms: AtomicU64,
     started: Instant,
     cache: Mutex<Lru>,
+    /// When each failure condition was last logged, and how many repeats have gone unlogged since.
+    failures: Mutex<HashMap<&'static str, (Option<Instant>, u64)>>,
 }
 
 impl AppState {
@@ -308,10 +336,7 @@ fn quantize_int8(cls: &[f32]) -> Vec<i32> {
 /// also lazily loads the model on first use and refreshes the idle timer.
 fn infer(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
     let mut guard = state.model.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(Model::load(&state.cfg)?);
-    }
-    let model = guard.as_mut().unwrap();
+    let model = ensure_loaded(&mut guard, &state.cfg)?;
 
     let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
@@ -365,10 +390,7 @@ fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>
 /// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
 fn count_tokens(state: &AppState, texts: &[String]) -> anyhow::Result<usize> {
     let mut guard = state.model.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(Model::load(&state.cfg)?);
-    }
-    let model = guard.as_ref().unwrap();
+    let model = ensure_loaded(&mut guard, &state.cfg)?;
     let mut total = 0usize;
     for t in texts {
         if is_blank(t) {
@@ -437,9 +459,44 @@ struct ErrResp {
 
 type AppErr = (StatusCode, Json<ErrResp>);
 
-fn internal(e: anyhow::Error) -> AppErr {
-    tracing::error!("embed error: {e:#}");
+/// A failing condition repeats on every request — a missing model fails all of them — so each is
+/// logged at most this often, with a count of the repeats in between. A timestamp, not a timer.
+const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// The 500 for a failed embed. The real error goes to the log, rate-limited per condition; the text
+/// being embedded never does.
+fn internal(state: &AppState, e: anyhow::Error) -> AppErr {
+    let (condition, detail) = match e.downcast_ref::<LoadFailed>() {
+        Some(_) => ("model load", format!("{:#}", e.root_cause())),
+        None => ("embedding", format!("{e:#}")),
+    };
+    let now = Instant::now();
+    let mut failures = state.failures.lock().unwrap();
+    let (last, repeats) = failures.entry(condition).or_insert((None, 0));
+    if last.is_some_and(|at| now.duration_since(at) < FAILURE_LOG_EVERY) {
+        *repeats += 1;
+    } else {
+        *last = Some(now);
+        match std::mem::take(repeats) {
+            0 => tracing::error!("{condition} failed: {detail}"),
+            n => tracing::error!("{condition} failed: {detail} ({n} more since the last line)"),
+        }
+    }
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrResp { detail: "embedding failed".into() }))
+}
+
+/// Run `f` on the blocking pool, where all tokenizing and inference happens, turning any failure
+/// into the logged 500.
+async fn run_blocking<T: Send + 'static>(
+    state: &Arc<AppState>,
+    f: impl FnOnce(&AppState) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, AppErr> {
+    let st = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || f(&st)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(internal(state, e)),
+        Err(e) => Err(internal(state, e.into())),
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
@@ -506,6 +563,22 @@ async fn cors(req: Request, next: Next) -> Response {
     resp
 }
 
+/// One line per request, written once the response is ready. Only added to the router when
+/// `LOG_REQUESTS` is on.
+async fn log_request(req: Request, next: Next) -> Response {
+    let (method, uri) = (req.method().clone(), req.uri().clone());
+    let started = Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!("{}", request_line(&method, &uri, resp.status(), started.elapsed()));
+    resp
+}
+
+/// `<METHOD> <path> <status> <ms>ms`, with the path alone: the query of `GET /embed?text=` is the
+/// user's search, and it must never reach a log.
+fn request_line(method: &Method, uri: &Uri, status: StatusCode, took: Duration) -> String {
+    format!("{method} {} {} {}ms", uri.path(), status.as_u16(), took.as_millis())
+}
+
 fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
     let Some(want) = want else { return false };
     let given = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -568,10 +641,7 @@ async fn embed_get(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EmbedQuery>,
 ) -> Result<Json<EmbedResp>, AppErr> {
-    let vector = tokio::task::spawn_blocking(move || embed_one(&state, &q.text))
-        .await
-        .map_err(|e| internal(e.into()))?
-        .map_err(internal)?;
+    let vector = run_blocking(&state, move |st| embed_one(st, &q.text)).await?;
     Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -579,10 +649,7 @@ async fn embed_post(
     State(state): State<Arc<AppState>>,
     Json(body): Json<EmbedBody>,
 ) -> Result<Json<EmbedResp>, AppErr> {
-    let vector = tokio::task::spawn_blocking(move || embed_one(&state, &body.text))
-        .await
-        .map_err(|e| internal(e.into()))?
-        .map_err(internal)?;
+    let vector = run_blocking(&state, move |st| embed_one(st, &body.text)).await?;
     Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -604,12 +671,8 @@ async fn embed_batch(
     // rejected cheap work and admitted expensive work, and `min(chars, max_tokens)` looked sound but
     // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
     // `count_tokens`), which let 5x the budget through.
-    let state_for_count = Arc::clone(&state);
     let texts_for_count = body.texts.clone();
-    let total = tokio::task::spawn_blocking(move || count_tokens(&state_for_count, &texts_for_count))
-        .await
-        .map_err(|e| internal(e.into()))?
-        .map_err(internal)?;
+    let total = run_blocking(&state, move |st| count_tokens(st, &texts_for_count)).await?;
     if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -622,10 +685,7 @@ async fn embed_batch(
             }),
         ));
     }
-    let vectors = tokio::task::spawn_blocking(move || embed_many(&state, &body.texts))
-        .await
-        .map_err(|e| internal(e.into()))?
-        .map_err(internal)?;
+    let vectors = run_blocking(&state, move |st| embed_many(st, &body.texts)).await?;
     Ok(Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL }))
 }
 
@@ -682,6 +742,7 @@ async fn main() -> anyhow::Result<()> {
         model: Mutex::new(None),
         last_used_ms: AtomicU64::new(0),
         started: Instant::now(),
+        failures: Mutex::new(HashMap::new()),
         cfg,
     });
 
@@ -694,6 +755,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // What this process is running with, secret-free: the metrics token is reported as on or off.
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let summary = format!(
+        "den-embed {} ({MODEL_LABEL}, idle-unload {}, max_tokens {}, max_request_tokens {}, metrics {}, request log {})",
+        env!("CARGO_PKG_VERSION"),
+        state.cfg.idle_unload.map_or("off".into(), |d| format!("{}s", d.as_secs())),
+        state.cfg.max_tokens,
+        state.cfg.max_request_tokens,
+        on_off(state.cfg.metrics_token.is_some()),
+        on_off(state.cfg.log_requests),
+    );
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -701,7 +773,8 @@ async fn main() -> anyhow::Result<()> {
     // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
     let shutdown = shutdown_signal();
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    tracing::info!("listening on http://{addr} (port {bound})");
+    // "(port N)" stays last: tests/shutdown.rs reads the bound port from the end of this line.
+    tracing::info!("{summary} listening on http://{addr} (port {bound})");
 
     let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
     match &outcome {
@@ -725,15 +798,17 @@ async fn main() -> anyhow::Result<()> {
 /// router already holds; added before, unknown paths and 405s would go out without the CORS header.
 fn router(state: Arc<AppState>) -> Router {
     let max_body = state.cfg.max_body_bytes;
-    Router::new()
+    let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/embed", get(embed_get).post(embed_post))
         .route("/embed/batch", post(embed_batch))
         .fallback(|| async { not_found() })
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
-        .layer(middleware::from_fn(cors))
-        .with_state(state)
+        .layer(middleware::from_fn(cors));
+    // Outermost, so the logged status is what the client got, preflights included.
+    let app = if state.cfg.log_requests { app.layer(middleware::from_fn(log_request)) } else { app };
+    app.with_state(state)
 }
 
 /// Exit without running `atexit` handlers.
@@ -1071,8 +1146,18 @@ mod tests {
             model: Mutex::new(None),
             last_used_ms: AtomicU64::new(0),
             started: Instant::now() - Duration::from_secs(60),
+            failures: Mutex::new(HashMap::new()),
             cfg,
         })
+    }
+
+    /// `GET /embed?text=` carries the user's search in the query, so the line has the path alone.
+    #[test]
+    fn the_request_log_never_carries_the_query() {
+        let uri: Uri = "/embed?text=a%20private%20search".parse().unwrap();
+        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(12));
+        assert_eq!(line, "GET /embed 200 12ms");
+        assert!(!line.contains("private"), "{line}");
     }
 
     async fn scrape(state: Arc<AppState>, auth: Option<&str>) -> (StatusCode, String, String) {

@@ -61,6 +61,7 @@ boot and stays. Measured footprints for each state are in CLAUDE.md.
 |---|---|---|
 | `PORT` | 8080 | Listen port, on 0.0.0.0. |
 | `METRICS_TOKEN` | unset | Enables `/metrics`. |
+| `LOG_REQUESTS` | unset | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, never with the query string. Empty or `0` is off. |
 | `MODEL_DIR` | `/models` | Directory holding `model_int8.onnx` and `tokenizer.json`. |
 | `ONNX_PATH`, `TOKENIZER_PATH` | inside the model dir | Point at either file directly. |
 | `IDLE_UNLOAD_SECS` | 0 | Unload the model after this long idle (0–86400); 0 keeps it loaded. |
