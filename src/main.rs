@@ -15,11 +15,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use blake2::digest::consts::U16;
@@ -103,6 +105,8 @@ struct Config {
     cache_max: usize,
     idle_unload: Option<Duration>,
     intra_threads: usize,
+    /// Bearer token for `/metrics`; `None` (unset or blank) turns the route off.
+    metrics_token: Option<String>,
 }
 
 /// Read a numeric env var, clamped to `[min, max]`.
@@ -172,6 +176,10 @@ impl Config {
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
             intra_threads: env_clamped("DEN_EMBED_INTRA_THREADS", 0, 0, 256),
+            metrics_token: std::env::var("METRICS_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
         }
     }
 }
@@ -444,6 +452,84 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
     })
 }
 
+/// `GET /metrics`: Prometheus text format, behind `Authorization: Bearer <METRICS_TOKEN>`.
+///
+/// With no token configured, or the wrong one given, it answers exactly as an unknown route does — a
+/// bare 404 — so an install that has not set one is not told there is something here to poke at.
+///
+/// A scrape is NOT activity, for the same reason `/health` is not: a scraper polling every 15 seconds
+/// would otherwise keep ~1.2 GB resident all day, which is precisely what idle-unload exists to
+/// prevent. So this only reads — it never calls `touch` or `Model::load` — and everything it reports
+/// is state the service already keeps for its own purposes, computed here on request.
+async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !metrics_authorized(state.cfg.metrics_token.as_deref(), &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")],
+        render_metrics(&state),
+    )
+        .into_response()
+}
+
+fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(want) = want else { return false };
+    let given = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let given = given.strip_prefix("Bearer ").unwrap_or(given).trim();
+    constant_time_eq(given.as_bytes(), want.as_bytes())
+}
+
+/// Compare without stopping at the first differing byte, so response time does not reveal how much
+/// of a guess was right. A length mismatch returns at once, as Go's `subtle.ConstantTimeCompare`
+/// does: that leaks only the token's length, not its contents.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn render_metrics(state: &AppState) -> String {
+    // TRY the model lock, never wait on it: inference holds it for the whole of every request (~5 s
+    // for a full batch), and a scrape must not queue behind that. Its only holders are inference,
+    // which loads the model before anything else, and the unloader's momentary check — so a held
+    // lock means the model is in use, and reads as loaded.
+    let loaded = match state.model.try_lock() {
+        Ok(model) => model.is_some(),
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Poisoned(p)) => p.into_inner().is_some(),
+    };
+    let (entries, capacity) = {
+        let cache = state.cache.lock().unwrap();
+        (cache.map.len(), cache.cap)
+    };
+    // The same arithmetic the unloader does, so this is the number it compares against its limit.
+    let now_ms = state.started.elapsed().as_millis() as u64;
+    let idle_secs = now_ms.saturating_sub(state.last_used_ms.load(Ordering::Relaxed)) / 1000;
+    let unload_secs = state.cfg.idle_unload.map_or(0, |d| d.as_secs());
+
+    format!(
+        "# HELP embed_build_info Build identity.
+# TYPE embed_build_info gauge
+embed_build_info{{version=\"{version}\",model=\"{MODEL_LABEL}\"}} 1
+# HELP embed_model_loaded Model resident (1) or idle-unloaded (0).
+# TYPE embed_model_loaded gauge
+embed_model_loaded {loaded}
+# HELP embed_cache_entries Vectors held in the embedding cache.
+# TYPE embed_cache_entries gauge
+embed_cache_entries {entries}
+# HELP embed_cache_capacity Most vectors the embedding cache will hold (0 = cache off).
+# TYPE embed_cache_capacity gauge
+embed_cache_capacity {capacity}
+# HELP embed_idle_seconds Seconds since the last inference, or since boot if there has been none.
+# TYPE embed_idle_seconds gauge
+embed_idle_seconds {idle_secs}
+# HELP embed_idle_unload_seconds Idle time after which the model is unloaded (0 = never).
+# TYPE embed_idle_unload_seconds gauge
+embed_idle_unload_seconds {unload_secs}
+",
+        version = env!("CARGO_PKG_VERSION"),
+        loaded = u8::from(loaded),
+    )
+}
+
 async fn embed_get(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EmbedQuery>,
@@ -577,6 +663,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/embed", get(embed_get).post(embed_post))
         .route("/embed/batch", post(embed_batch))
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
@@ -932,6 +1019,90 @@ mod tests {
             "a padded number is still a number"
         );
         std::env::remove_var("DEN_EMBED_TEST_MALFORMED");
+    }
+
+    /// A state as `main` builds it with idle-unload on — model unloaded, idle clock never reset — but a
+    /// minute old, so anything that reset the idle clock would move it visibly.
+    fn metrics_state(token: Option<&str>) -> Arc<AppState> {
+        let mut cfg = Config::from_env();
+        cfg.metrics_token = token.map(Into::into);
+        cfg.idle_unload = Some(Duration::from_secs(600));
+        Arc::new(AppState {
+            cache: Mutex::new(Lru::new(cfg.cache_max)),
+            model: Mutex::new(None),
+            last_used_ms: AtomicU64::new(0),
+            started: Instant::now() - Duration::from_secs(60),
+            cfg,
+        })
+    }
+
+    async fn scrape(state: Arc<AppState>, auth: Option<&str>) -> (StatusCode, String, String) {
+        let mut headers = HeaderMap::new();
+        if let Some(auth) = auth {
+            headers.insert(AUTHORIZATION, auth.parse().unwrap());
+        }
+        let resp = metrics(State(state), headers).await;
+        let status = resp.status();
+        let content_type =
+            resp.headers().get(CONTENT_TYPE).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, content_type, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// Unset means OFF, and indistinguishable from a route that does not exist — not an empty 200.
+    #[tokio::test]
+    async fn metrics_is_not_found_without_a_configured_token() {
+        for auth in [None, Some("Bearer "), Some("Bearer anything")] {
+            let (status, _, body) = scrape(metrics_state(None), auth).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "served metrics with no token configured ({auth:?})");
+            assert!(body.is_empty(), "a 404 that says something is not an unknown route: {body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_is_not_found_with_the_wrong_token() {
+        for auth in [None, Some("Bearer wrong"), Some("Bearer s3cre"), Some("Bearer s3cret2")] {
+            let (status, _, _) = scrape(metrics_state(Some("s3cret")), auth).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{auth:?} was accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_serves_prometheus_text_with_the_right_token() {
+        let (status, content_type, body) = scrape(metrics_state(Some("s3cret")), Some("Bearer s3cret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
+        let build_info =
+            format!("embed_build_info{{version=\"{}\",model=\"bge-m3\"}} 1\n", env!("CARGO_PKG_VERSION"));
+        assert!(body.contains(&build_info), "no build_info line in:\n{body}");
+        assert!(body.contains("\nembed_idle_unload_seconds 600\n"), "{body}");
+        assert!(body.contains("# TYPE embed_model_loaded gauge\n"), "{body}");
+    }
+
+    /// A scrape must not keep the model warm: counting it as activity would pin ~1.2 GB resident for
+    /// as long as anything polls, and loading the model to report on it would be worse.
+    #[tokio::test]
+    async fn a_scrape_is_not_activity_and_does_not_load_the_model() {
+        let state = metrics_state(Some("s3cret"));
+        let (_, _, body) = scrape(state.clone(), Some("Bearer s3cret")).await;
+
+        assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "the scrape reset the idle clock");
+        assert!(state.model.lock().unwrap().is_none(), "the scrape loaded the model");
+        assert!(body.contains("\nembed_model_loaded 0\n"), "{body}");
+        let idle: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("embed_idle_seconds "))
+            .and_then(|v| v.parse().ok())
+            .expect("no embed_idle_seconds sample");
+        assert!(idle >= 60, "idle clock reads {idle}s on a service untouched for a minute");
+    }
+
+    #[test]
+    fn constant_time_eq_is_plain_equality() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(!constant_time_eq(b"", b"s3cret"));
     }
 
     #[test]
