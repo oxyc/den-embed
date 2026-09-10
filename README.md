@@ -1,121 +1,109 @@
 # den-embed
 
-A tiny **self-hosted** embedding microservice — the single embedding path for the
-Den movie-discovery stack.
+The embedding service behind Den's semantic search: **BAAI/bge-m3**, int8, 1024 dims, served over
+HTTP by a small Rust binary (axum + ONNX Runtime via `ort` + HuggingFace `tokenizers`). den-atlas
+calls it to embed search queries; den-dataset runs the same image to embed the corpus.
 
-It embeds **both** sides of the search so their vectors are guaranteed comparable:
+## The alignment rule
 
-- the **corpus** (batch, called by the `den-dataset` producer), and
-- **live search queries** (single, called by the app at query time).
+Query vectors and corpus vectors are only comparable because both come out of **one path**: the same
+tokenizer, the same model file, the same ONNX Runtime, the same pooling and the same quantization.
+Change any of them on one side and the other side has to be re-embedded through the new path. "The
+same model" is not enough — an ONNX Runtime upgrade alone moved the int8 output far enough to reorder
+results (CLAUDE.md has the measurements), and a different serving path such as Workers AI's
+`@cf/baai/bge-m3` would too. `vector_epoch` in `/health` names the generation of vectors this build
+produces; den-dataset records it with a corpus and refuses to mix generations.
 
-One model, one serving path, one quantization function → corpus and query vectors
-are always in the same space. That alignment is the whole point of this repo: the
-int8 quantization lives **here and nowhere else**, so both sides quantize identically.
+## The path
 
-## Model
+1. Blank or whitespace-only text returns an all-zero vector, never an error.
+2. The text is cut to `DEN_EMBED_MAX_CHARS` characters, then the tokenizer truncates it to
+   `DEN_EMBED_MAX_TOKENS` tokens. Both cuts are silent.
+3. `tokenizer.json` and `onnx/model_int8.onnx` from `Xenova/bge-m3`, pinned to a commit and
+   checksum-verified in the Dockerfile, run on the ONNX Runtime CPU provider.
+4. CLS pooling: token 0 of `last_hidden_state`.
+5. L2-normalize in f64, then `clamp(round_half_to_even(x * 127), -127, 127)`.
 
-- **BAAI/bge-m3** dense embedding, **1024-dim**, served via
-  [fastembed](https://github.com/qdrant/fastembed) (ONNX Runtime). No GPU, no vector DB.
-- fastembed 0.8 does not ship bge-m3 in its built-in registry, so it is registered
-  as a custom model pointing at the **int8-quantized ONNX** export
-  [`Xenova/bge-m3` → `onnx/model_int8.onnx`](https://huggingface.co/Xenova/bge-m3)
-  (543 MB vs ~2.2 GB for fp32). Pooling: **CLS**. The export already L2-normalizes
-  its output.
-- The model loads **once at boot** (uvicorn `lifespan`) and stays warm — never
-  reloaded per request.
+A batch is embedded one text at a time, so a text gets the same vector in a batch as on its own.
+Vectors are cached in memory, keyed by content.
 
-## Contract
+## Routes
 
-Other repos depend on these exact shapes.
-
-| Method | Path | Body / query | Response |
+| Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/health` | — | `{"status":"ok","model":"bge-m3","dims":1024}` |
-| GET | `/embed` | `?text=<url-encoded>` | `{"vector":[<1024 int8>],"dims":1024,"model":"bge-m3"}` |
-| POST | `/embed/batch` | `{"texts":["…","…"]}` | `{"vectors":[[int8…],…],"dims":1024,"model":"bge-m3"}` |
+| GET | `/health` | — | `{"status":"ok","model":"bge-m3","dims":1024,"vector_epoch":1,"runtime":"den-embed/<version>","max_tokens":512}` |
+| GET | `/embed` | `?text=<url-encoded>` | `{"vector":[<1024 ints>],"dims":1024,"model":"bge-m3"}` |
+| POST | `/embed` | `{"text":"…"}` | same as GET |
+| POST | `/embed/batch` | `{"texts":["…","…"]}` | `{"vectors":[[…],…],"dims":1024,"model":"bge-m3"}` |
+| GET | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | Prometheus text (`embed_*` series) |
 
-- The vector is the bge-m3 **dense** embedding, **L2-normalized then quantized to
-  int8** by `round(x * 127)` clamped to `[-127, 127]`.
-- **Empty/whitespace** text returns an all-**zero** vector (the pipeline sends
-  tag-only docs and occasionally empty strings) — never an error.
-- `/embed/batch` embeds the whole non-blank list in a **single** fastembed call.
+- `/health` is constant and never loads the model, so it says `ok` even when the model is missing.
+  To prove the service can embed, embed something.
+- `/metrics` answers a bare 404, like an unknown route, when `METRICS_TOKEN` is unset or the token is
+  wrong.
+- 413 when a batch has more than `DEN_EMBED_MAX_BATCH` texts or more than
+  `DEN_EMBED_MAX_REQUEST_TOKENS` tokens in total, or a body exceeds `DEN_EMBED_MAX_BODY_BYTES`.
+- 500 `{"detail":"embedding failed"}` when inference fails; the real error goes to the log.
 
-### The quantization (the alignment keystone)
+## Configuration
 
-```python
-def quantize_int8(vector: np.ndarray) -> list[int]:
-    v = np.asarray(vector, dtype=np.float64)
-    norm = np.linalg.norm(v)
-    if norm > 0:
-        v = v / norm
-    q = np.clip(np.round(v * 127.0), -127, 127)
-    return q.astype(np.int8).astype(int).tolist()
-```
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `PORT` | 8080 | | Listen port, on 0.0.0.0. |
+| `METRICS_TOKEN` | unset | | Enables `/metrics`. |
+| `DEN_EMBED_MODEL_DIR` | `/models` | | Directory holding `model_int8.onnx` and `tokenizer.json`. |
+| `DEN_EMBED_ONNX`, `DEN_EMBED_TOKENIZER` | inside the model dir | | Point at either file directly. |
+| `DEN_EMBED_IDLE_UNLOAD_SEC` | 0 | 0–86400 | Unload the model after this long idle; 0 keeps it loaded. |
+| `DEN_EMBED_MAX_CHARS` | 8000 | 500–100000 | Per-text character cut. |
+| `DEN_EMBED_MAX_TOKENS` | 512 | 16–1024 | Per-text token cap. Changing it changes the vector of anything longer. |
+| `DEN_EMBED_MAX_REQUEST_TOKENS` | 8192 | 512–12288 | Total tokens per request. |
+| `DEN_EMBED_MAX_BATCH` | 512 | 1–4096 | Texts per batch. A rejection threshold, not a micro-batch. |
+| `DEN_EMBED_MAX_BODY_BYTES` | 4 MiB | 64 KiB–16 MiB | Request body limit. |
+| `DEN_EMBED_CACHE_MAX` | 8192 | 0–32768 | Cached vectors (~4.2 KB each); 0 turns the cache off. |
+| `DEN_EMBED_INTRA_THREADS` | 0 | 0–256 | ONNX Runtime intra-op threads; 0 uses all cores. |
+| `DEN_EMBED_DRAIN_GRACE_SEC` | 8 | 1–9 | How long a SIGTERM waits for in-flight requests. |
 
-Normalizing here is safe even though the ONNX export already normalizes: dividing
-a unit-length vector by its (== 1.0) norm is a no-op, so there is no
-double-normalization hazard.
+A number outside its range is clamped and a malformed one falls back to the default, each with a log
+line. The ranges are memory and latency bounds, sized against a 1536 MiB container and den-atlas's
+10 s timeout on this call; CLAUDE.md explains each one.
 
-> **Batch vs single:** batched inference pads to the longest sequence in the
-> batch, which nudges a few int8 components of a given text by at most ~1–2 units
-> (cosine ≈ 0.99). Corpus (batched) and query (single) vectors for the same text
-> stay comparable; they are not bitwise identical. This is inherent ONNX
-> batch-padding behavior, not a misalignment.
+## Idle unload
 
-## Run
+With `DEN_EMBED_IDLE_UNLOAD_SEC` above 0 (the box sets 600) the model is not loaded at boot. The first
+request that needs it loads it, and a background task drops it after that many seconds without an
+inference, then hands the freed memory back to the OS. `/health` and `/metrics` do not count as
+activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at boot and
+stays. Measured footprints for each state are in CLAUDE.md.
+
+## Run and test
 
 ```sh
-./run.sh                       # creates .venv, installs, serves on 127.0.0.1:8080
-DEN_EMBED_PORT=9000 ./run.sh   # override host/port via DEN_EMBED_HOST/PORT
-```
-
-First boot downloads the ONNX model (~560 MB) into the fastembed cache; later boots
-are fast (~2 s to load).
-
-```sh
-curl 'http://127.0.0.1:8080/health'
+DEN_EMBED_MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release
 curl 'http://127.0.0.1:8080/embed?text=a%20heist%20thriller%20about%20a%20bank%20robbery'
 curl -X POST http://127.0.0.1:8080/embed/batch \
   -H 'content-type: application/json' \
   -d '{"texts":["a bank robbery","","a quiet romance"]}'
 ```
 
-## Test
+Take the model files from the revision the Dockerfile pins, so local vectors match the image's.
 
 ```sh
-.venv/bin/python -m pytest -q
+cargo test
+DEN_EMBED_TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored   # the one test that needs the model
 ```
 
-- **Quantization** — deterministic, bounded to `[-127, 127]`, `×127` rounding
-  matches hand-computed floats.
-- **Semantic** — same text embeds identically; a related pair
-  (`"a heist thriller about a bank robbery"` vs `"a crew plans an elaborate bank
-  robbery"`) has a higher int8 dot-product than an unrelated pair (vs `"a gentle
-  romance in the countryside"`). Measured: **related ≈ 11044 > unrelated ≈ 7790**.
-- **API** — `/health`, `/embed`, `/embed/batch` shapes via FastAPI's `TestClient`.
+The unit tests pin the quantization, the cache key, the limits and `/metrics`; `tests/shutdown.rs`
+runs the binary to test SIGTERM draining. CI also runs `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings`.
 
-## Footprint (measured, CPU, Apple Silicon)
+`tests/parity_check.py <base_url> <golden.ndjson>` is a manual parity gate against a running
+instance: it compares each `{"text","vector"}` line with what `/embed` returns now. Golden sets
+captured from the Python service predate the ONNX Runtime 1.28 move and no longer match exactly.
 
-| Metric | Value |
-|---|---|
-| Model on disk (int8 ONNX) | **543 MB** (model dir 559 MB) |
-| RSS after model load, idle | **~1.0 GB** |
-| `/embed` single latency | **~11 ms** p50 (8–17 ms) |
-| `/embed/batch` throughput | **~78 docs/sec** (64 docs / 0.82 s) |
-| Model load (cached) | **~2.2 s** |
+## Deployment
 
-RSS is ~1 GB because ONNX Runtime expands the graph and its CPU arena at load;
-int8 shrinks disk more than resident memory. Keep it as a single always-on,
-single-worker process (the model is held in-process and warm); scale out by
-running more processes, each with its own warm copy.
-
-## Self-hosted now, Workers AI later
-
-This runs self-hosted today. bge-m3 dense is also available on **Cloudflare
-Workers AI** (`@cf/baai/bge-m3`, dense-only), a possible future serving path.
-
-**Alignment rule:** the corpus and queries must always go through the *same*
-embedding path. If you ever move query embedding to Workers AI, you **must
-re-embed the entire corpus through it too** — a different serving path (even the
-"same" model) yields subtly different vectors, and the int8 quantization would
-have to be reproduced there byte-for-byte. Do not mix paths.
+On the homelab box it runs as a rootful-podman Quadlet container in the `den` stack — see the den
+repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as
+`http://den-embed:8080` on `den.network`, capped at 1536 MiB, running as uid 65532 with the model
+baked into the image. Images publish on a `v*` tag, and `den-update` picks up the new `:latest`
+within a day, proving it by embedding a string before pinning its digest.

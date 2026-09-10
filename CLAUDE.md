@@ -75,18 +75,21 @@ change, a pooling or normalisation change.
 
 ## Releasing — READ THIS: code on `main` ≠ running on the box
 
-The `image` job in `.github/workflows/ci.yml` builds + pushes `ghcr.io/oxyc/den-embed` **only on a
-`v*` tag** or a manual `workflow_dispatch`. A push to `main` runs **tests only — no image**. So a
-merged change does NOT reach the box until you cut a release:
+`.github/workflows/docker-publish.yml` builds + pushes `ghcr.io/oxyc/den-embed` **only on a `v*`
+tag** or a manual `workflow_dispatch`, after running the whole of `ci.yml` against the tagged commit,
+and refuses a tag that is not `v` + Cargo.toml's version. A push to `main` runs **tests only — no
+image**. So a merged change does NOT reach the box until you cut a release:
 
 ```
-git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z     # → CI builds+pushes :latest, :vX.Y.Z, :<sha>
+git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z     # → :X.Y.Z, :X.Y, :X, :<sha> and :latest
 ```
 
-Then `podman-auto-update` on the box pulls the new `:latest` (daily), or force it now:
+Then `den-update` on the box picks up the new `:latest` within a day (a daily timer; it proves the
+image by embedding a string, pins its digest and restarts — see the den repo's `deploy/README.md`),
+or run it now:
 
 ```
-ssh <host> 'incus exec den -- den-update'    # pulls updated addon images + refreshes the atlas dataset
+ssh <host> 'incus exec den -- den-update den-embed'
 ```
 
 This is intentional (a tag = a deliberate release), and **every den-* addon works the same way**. The
@@ -99,8 +102,9 @@ After any change you want running, cut the tag.
 When `> 0` (the stack sets `600`): the model is **not** loaded at boot — it loads lazily on the first
 `/embed` (~1.3 s cold), and a background task drops it (session + tokenizer) after that many idle seconds,
 then `malloc_trim`s so the freed arenas actually return to the OS — landing at **~43 MB idle** (vs ~1.2 GB
-resident with the model; ~25 MB before the first load). Without the trim it plateaus ~600 MB. `/health`
-does **not** count as activity, so a healthcheck never keeps it warm. Right for the box, where the Apple TV
+resident with the model; ~25 MB before the first load). Without the trim it plateaus ~600 MB. Neither
+`/health` nor `/metrics` counts as activity or loads the model, so nothing polling them keeps it warm.
+Right for the box, where the Apple TV
 app — and therefore any embedding demand — is idle most of the day. `0` keeps it always loaded.
 
 The idle floor (~25 MB) is the statically-linked ONNX Runtime's resident code/data; getting nearer to
