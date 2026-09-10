@@ -1,6 +1,5 @@
 target/
-.venv/
 .git/
+.env
 *.md
 tests/
-__pycache__/

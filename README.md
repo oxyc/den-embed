@@ -27,6 +27,14 @@ produces; den-dataset records it with a corpus and refuses to mix generations.
 A batch is embedded one text at a time, so a text gets the same vector in a batch as on its own.
 Vectors are cached in memory, keyed by content.
 
+## Idle unload
+
+With `IDLE_UNLOAD_SECS` above 0 (the box sets 600) the model is not loaded at boot. The first
+request that needs it loads it, and a background task drops it after that many seconds without an
+inference, then hands the freed memory back to the OS. `/health`, `/metrics` and `OPTIONS` do not
+count as activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at
+boot and stays. Measured footprints for each state are in CLAUDE.md.
+
 ## Routes
 
 | Method | Path | Request | Response |
@@ -49,35 +57,27 @@ Vectors are cached in memory, keyed by content.
 
 ## Configuration
 
-| Variable | Default | Range | Meaning |
-|---|---|---|---|
-| `PORT` | 8080 | | Listen port, on 0.0.0.0. |
-| `METRICS_TOKEN` | unset | | Enables `/metrics`. |
-| `MODEL_DIR` | `/models` | | Directory holding `model_int8.onnx` and `tokenizer.json`. |
-| `ONNX_PATH`, `TOKENIZER_PATH` | inside the model dir | | Point at either file directly. |
-| `IDLE_UNLOAD_SECS` | 0 | 0–86400 | Unload the model after this long idle; 0 keeps it loaded. |
-| `MAX_CHARS` | 8000 | 500–100000 | Per-text character cut. |
-| `MAX_TOKENS` | 512 | 16–1024 | Per-text token cap. Changing it changes the vector of anything longer. |
-| `MAX_REQUEST_TOKENS` | 8192 | 512–12288 | Total tokens per request. |
-| `MAX_BATCH` | 512 | 1–4096 | Texts per batch. A rejection threshold, not a micro-batch. |
-| `MAX_BODY_BYTES` | 4 MiB | 64 KiB–16 MiB | Request body limit. |
-| `CACHE_MAX_ENTRIES` | 8192 | 0–32768 | Cached vectors (~4.2 KB each); 0 turns the cache off. |
-| `INTRA_THREADS` | 0 | 0–256 | ONNX Runtime intra-op threads; 0 uses all cores. |
-| `DRAIN_GRACE_SECS` | 8 | 1–9 | How long a SIGTERM waits for in-flight requests. |
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | 8080 | Listen port, on 0.0.0.0. |
+| `METRICS_TOKEN` | unset | Enables `/metrics`. |
+| `MODEL_DIR` | `/models` | Directory holding `model_int8.onnx` and `tokenizer.json`. |
+| `ONNX_PATH`, `TOKENIZER_PATH` | inside the model dir | Point at either file directly. |
+| `IDLE_UNLOAD_SECS` | 0 | Unload the model after this long idle (0–86400); 0 keeps it loaded. |
+| `MAX_CHARS` | 8000 | Per-text character cut (500–100000). |
+| `MAX_TOKENS` | 512 | Per-text token cap (16–1024). Changing it changes the vector of anything longer. |
+| `MAX_REQUEST_TOKENS` | 8192 | Total tokens per request (512–12288). |
+| `MAX_BATCH` | 512 | Texts per batch (1–4096). A rejection threshold, not a micro-batch. |
+| `MAX_BODY_BYTES` | 4 MiB | Request body limit (64 KiB–16 MiB). |
+| `CACHE_MAX_ENTRIES` | 8192 | Cached vectors, ~4.2 KB each (0–32768); 0 turns the cache off. |
+| `INTRA_THREADS` | 0 | ONNX Runtime intra-op threads (0–256); 0 uses all cores. |
+| `DRAIN_GRACE_SECS` | 8 | How long a SIGTERM waits for in-flight requests (1–9). |
 
 A number outside its range is clamped and a malformed one falls back to the default, each with a log
 line. The ranges are memory and latency bounds, sized against a 1536 MiB container and den-atlas's
-10 s timeout on this call; CLAUDE.md explains each one.
+10 s timeout on this call; CLAUDE.md explains each one. `.env.example` lists the same variables.
 
-## Idle unload
-
-With `IDLE_UNLOAD_SECS` above 0 (the box sets 600) the model is not loaded at boot. The first
-request that needs it loads it, and a background task drops it after that many seconds without an
-inference, then hands the freed memory back to the OS. `/health` and `/metrics` do not count as
-activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at boot and
-stays. Measured footprints for each state are in CLAUDE.md.
-
-## Run and test
+## Run
 
 ```sh
 MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release
@@ -102,7 +102,7 @@ runs the binary to test SIGTERM draining. CI also runs `cargo fmt --check` and
 instance: it compares each `{"text","vector"}` line with what `/embed` returns now. Golden sets
 captured from the Python service predate the ONNX Runtime 1.28 move and no longer match exactly.
 
-## Deployment
+## Deploy
 
 On the homelab box it runs as a rootful-podman Quadlet container in the `den` stack — see the den
 repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as

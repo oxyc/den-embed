@@ -1,8 +1,2 @@
 /target/
-Cargo.lock merge=binary
-
-# python leftovers + baked model cache
-.venv/
-__pycache__/
-models--*/
-/models/
+.env

@@ -101,8 +101,9 @@ After any change you want running, cut the tag.
 When `> 0` (the stack sets `600`): the model is **not** loaded at boot — it loads lazily on the first
 `/embed` (~1.3 s cold), and a background task drops it (session + tokenizer) after that many idle seconds,
 then `malloc_trim`s so the freed arenas actually return to the OS — landing at **~43 MB idle** (vs ~1.2 GB
-resident with the model; ~25 MB before the first load). Without the trim it plateaus ~600 MB. Neither
-`/health` nor `/metrics` counts as activity or loads the model, so nothing polling them keeps it warm.
+resident with the model; ~25 MB before the first load). Without the trim it plateaus ~600 MB. None of
+`/health`, `/metrics` or an `OPTIONS` preflight counts as activity or loads the model, so nothing
+polling them keeps it warm.
 Right for the box, where the Apple TV
 app — and therefore any embedding demand — is idle most of the day. `0` keeps it always loaded.
 
