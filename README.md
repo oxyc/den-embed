@@ -54,6 +54,9 @@ boot and stays. Measured footprints for each state are in CLAUDE.md.
 - 413 when a batch has more than `MAX_BATCH` texts or more than `MAX_REQUEST_TOKENS` tokens in
   total, or a body exceeds `MAX_BODY_BYTES`.
 - 500 `{"detail":"embedding failed"}` when inference fails; the real error goes to the log.
+- A successful `/embed` or `/embed/batch` carries `Server-Timing`, in milliseconds: `load` when this
+  request had to load the model, `tokenize`, `inference` (or `cache;desc=hit` when every text came
+  from the cache), then `total`.
 
 ## Configuration
 

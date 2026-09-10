@@ -232,11 +232,53 @@ impl std::fmt::Display for LoadFailed {
 }
 
 /// The model, loaded first if it is not resident — never loaded yet, or dropped by idle-unload.
-fn ensure_loaded<'a>(slot: &'a mut Option<Model>, cfg: &Config) -> anyhow::Result<&'a mut Model> {
+fn ensure_loaded<'a>(
+    slot: &'a mut Option<Model>,
+    cfg: &Config,
+    phases: &mut Phases,
+) -> anyhow::Result<&'a mut Model> {
     if slot.is_none() {
+        let started = Instant::now();
         *slot = Some(Model::load(cfg).context(LoadFailed)?);
+        Phases::add(&mut phases.load, started);
     }
     Ok(slot.as_mut().unwrap())
+}
+
+/// What one embed request spent its time on, reported in `Server-Timing`. Only instants read on
+/// work the request does anyway: nothing is kept once the response is built.
+#[derive(Default)]
+struct Phases {
+    /// Set only when this request had to load the model.
+    load: Option<Duration>,
+    tokenize: Option<Duration>,
+    inference: Option<Duration>,
+    cache_hits: usize,
+}
+
+impl Phases {
+    fn add(phase: &mut Option<Duration>, since: Instant) {
+        *phase.get_or_insert_default() += since.elapsed();
+    }
+
+    /// e.g. `load;dur=1283.4, tokenize;dur=0.6, inference;dur=312.0, total;dur=1596.3`, in ms. A
+    /// request whose every text came from the cache says `cache;desc=hit` instead of `inference`; a
+    /// blank text does neither, and reports `total` alone.
+    fn header(&self, total: Duration) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut parts = Vec::new();
+        for (name, phase) in [("load", self.load), ("tokenize", self.tokenize), ("inference", self.inference)]
+        {
+            if let Some(d) = phase {
+                parts.push(format!("{name};dur={:.1}", ms(d)));
+            }
+        }
+        if self.cache_hits > 0 && self.inference.is_none() {
+            parts.push("cache;desc=hit".into());
+        }
+        parts.push(format!("total;dur={:.1}", ms(total)));
+        parts.join(", ")
+    }
 }
 
 struct AppState {
@@ -334,11 +376,15 @@ fn quantize_int8(cls: &[f32]) -> Vec<i32> {
 /// Run the model on one already-truncated, non-blank text → CLS-pooled int8 vector.
 /// Serialized under the model lock (single-worker, like the Python service), which
 /// also lazily loads the model on first use and refreshes the idle timer.
-fn infer(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
+fn infer(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
     let mut guard = state.model.lock().unwrap();
-    let model = ensure_loaded(&mut guard, &state.cfg)?;
+    let model = ensure_loaded(&mut guard, &state.cfg, phases)?;
 
+    let started = Instant::now();
     let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Phases::add(&mut phases.tokenize, started);
+
+    let started = Instant::now();
     let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
     let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
     let seq = ids.len();
@@ -351,29 +397,31 @@ fn infer(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
     // last_hidden_state is [1, seq, 1024]; CLS pooling = token 0 = data[0..1024].
     let cls = &data[0..DIMS];
     let out = quantize_int8(cls);
+    Phases::add(&mut phases.inference, started);
 
     state.touch();
     Ok(out)
 }
 
-fn embed_one(state: &AppState, text: &str) -> anyhow::Result<Vec<i32>> {
+fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
     if is_blank(text) {
         return Ok(zero_vector());
     }
     let truncated: String = text.chars().take(state.cfg.max_chars).collect();
     let key = cache_key(&truncated);
     if let Some(hit) = state.cache.lock().unwrap().get(&key) {
+        phases.cache_hits += 1;
         return Ok(hit);
     }
-    let vector = infer(state, &truncated)?;
+    let vector = infer(state, &truncated, phases)?;
     state.cache.lock().unwrap().put(key, vector.clone());
     Ok(vector)
 }
 
-fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>>> {
+fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<Vec<Vec<i32>>> {
     // CLS pooling is padding-invariant, so per-item inference is byte-identical to
     // fastembed's batched path; the content cache handles repeats.
-    texts.iter().map(|t| embed_one(state, t)).collect()
+    texts.iter().map(|t| embed_one(state, t, phases)).collect()
 }
 
 /// The batch's real token count, capped per text exactly as inference will cap it.
@@ -388,16 +436,18 @@ fn embed_many(state: &AppState, texts: &[String]) -> anyhow::Result<Vec<Vec<i32>
 /// Tokenizing costs microseconds against ~330ms of inference per 512 tokens, so measuring beats
 /// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
 /// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
-fn count_tokens(state: &AppState, texts: &[String]) -> anyhow::Result<usize> {
+fn count_tokens(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<usize> {
     let mut guard = state.model.lock().unwrap();
-    let model = ensure_loaded(&mut guard, &state.cfg)?;
+    let model = ensure_loaded(&mut guard, &state.cfg, phases)?;
     let mut total = 0usize;
     for t in texts {
         if is_blank(t) {
             continue; // short-circuited before inference, costs nothing
         }
         let truncated: String = t.chars().take(state.cfg.max_chars).collect();
+        let started = Instant::now();
         let enc = model.tokenizer.encode(truncated, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Phases::add(&mut phases.tokenize, started);
         // Truncation already caps this at max_tokens; the min is belt and braces.
         total = total.saturating_add(enc.get_ids().len().min(state.cfg.max_tokens));
     }
@@ -640,23 +690,38 @@ embed_idle_unload_seconds {unload_secs}
 async fn embed_get(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EmbedQuery>,
-) -> Result<Json<EmbedResp>, AppErr> {
-    let vector = run_blocking(&state, move |st| embed_one(st, &q.text)).await?;
-    Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
+) -> Result<Response, AppErr> {
+    embed_single(state, q.text).await
 }
 
 async fn embed_post(
     State(state): State<Arc<AppState>>,
     Json(body): Json<EmbedBody>,
-) -> Result<Json<EmbedResp>, AppErr> {
-    let vector = run_blocking(&state, move |st| embed_one(st, &body.text)).await?;
-    Ok(Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL }))
+) -> Result<Response, AppErr> {
+    embed_single(state, body.text).await
+}
+
+/// `/embed`, from either the query or the body.
+async fn embed_single(state: Arc<AppState>, text: String) -> Result<Response, AppErr> {
+    let started = Instant::now();
+    let (vector, phases) = run_blocking(&state, move |st| {
+        let mut phases = Phases::default();
+        embed_one(st, &text, &mut phases).map(|v| (v, phases))
+    })
+    .await?;
+    Ok(timed(started, &phases, Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL })))
+}
+
+/// `body` with a `Server-Timing` header covering the request from `started`.
+fn timed(started: Instant, phases: &Phases, body: impl IntoResponse) -> Response {
+    ([("server-timing", phases.header(started.elapsed()))], body).into_response()
 }
 
 async fn embed_batch(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BatchBody>,
-) -> Result<Json<BatchResp>, AppErr> {
+) -> Result<Response, AppErr> {
+    let started = Instant::now();
     if body.texts.len() > state.cfg.max_batch {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -672,7 +737,11 @@ async fn embed_batch(
     // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
     // `count_tokens`), which let 5x the budget through.
     let texts_for_count = body.texts.clone();
-    let total = run_blocking(&state, move |st| count_tokens(st, &texts_for_count)).await?;
+    let (total, phases) = run_blocking(&state, move |st| {
+        let mut phases = Phases::default();
+        count_tokens(st, &texts_for_count, &mut phases).map(|n| (n, phases))
+    })
+    .await?;
     if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -685,8 +754,12 @@ async fn embed_batch(
             }),
         ));
     }
-    let vectors = run_blocking(&state, move |st| embed_many(st, &body.texts)).await?;
-    Ok(Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL }))
+    let (vectors, phases) = run_blocking(&state, move |st| {
+        let mut phases = phases;
+        embed_many(st, &body.texts, &mut phases).map(|v| (v, phases))
+    })
+    .await?;
+    Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })))
 }
 
 fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
@@ -1228,6 +1301,31 @@ mod tests {
             assert_eq!(resp.status(), status, "{method} {path}");
             assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{method} {path}");
         }
+    }
+
+    /// Without the model the only /embed that succeeds is a blank one, which does no phase at all.
+    #[tokio::test]
+    async fn an_embed_response_carries_server_timing() {
+        let resp = call(metrics_state(None), Method::GET, "/embed?text=").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let timing = header(&resp, "server-timing");
+        assert!(timing.starts_with("total;dur="), "{timing:?}");
+    }
+
+    #[test]
+    fn server_timing_names_only_the_phases_that_ran() {
+        let ms = Duration::from_millis;
+        let cold =
+            Phases { load: Some(ms(1283)), tokenize: Some(ms(1)), inference: Some(ms(312)), cache_hits: 0 };
+        assert_eq!(
+            cold.header(ms(1600)),
+            "load;dur=1283.0, tokenize;dur=1.0, inference;dur=312.0, total;dur=1600.0"
+        );
+        let cached = Phases { cache_hits: 2, ..Phases::default() };
+        assert_eq!(cached.header(ms(1)), "cache;desc=hit, total;dur=1.0");
+        // Some texts cached, some not: inference ran, so it is not a hit.
+        let mixed = Phases { tokenize: Some(ms(1)), inference: Some(ms(2)), cache_hits: 1, load: None };
+        assert!(!mixed.header(ms(3)).contains("cache"));
     }
 
     #[tokio::test]
