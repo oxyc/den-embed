@@ -71,9 +71,11 @@ unsafe fn malloc_trim(_pad: usize) -> i32 {
     0
 }
 
-// --- config from env (same names/defaults as server.py) --------------------
+// --- config from env ---------------------------------------------------------
+// PORT is unprefixed because every den addon reads the same name for it; the DEN_EMBED_* knobs are
+// this service's own. There is no host knob: like every other addon it binds 0.0.0.0, and staying
+// off the LAN is the container network's job (no published port), not the bind address's.
 struct Config {
-    host: String,
     port: u16,
     onnx_path: String,
     tokenizer_path: String,
@@ -143,8 +145,7 @@ impl Config {
         // A day is already far past "idle"; anything larger is a typo.
         let idle = env_clamped("DEN_EMBED_IDLE_UNLOAD_SEC", 0, 0, 86_400);
         Self {
-            host: std::env::var("DEN_EMBED_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("DEN_EMBED_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
+            port: std::env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
             onnx_path,
             tokenizer_path,
             max_chars: env_clamped("DEN_EMBED_MAX_CHARS", 8000, 500, 100_000),
@@ -543,7 +544,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = Config::from_env();
-    let addr = format!("{}:{}", cfg.host, cfg.port);
+    let addr = format!("0.0.0.0:{}", cfg.port);
     let max_body = cfg.max_body_bytes;
     let idle = cfg.idle_unload;
     let cache_max = cfg.cache_max;

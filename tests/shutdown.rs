@@ -69,8 +69,7 @@ fn start_logged(extra: &[(&str, &str)]) -> (Child, u16, Log) {
             cmd.env_remove(&k);
         }
     }
-    cmd.env("DEN_EMBED_PORT", "0")
-        .env("DEN_EMBED_HOST", "127.0.0.1")
+    cmd.env("PORT", "0")
         // Lazy-load, so no model file is ever opened.
         .env("DEN_EMBED_IDLE_UNLOAD_SEC", "1")
         .env("DEN_EMBED_MODEL_DIR", "/nonexistent-on-purpose")
@@ -309,8 +308,7 @@ fn inference_in_flight_does_not_extend_the_stop() {
         .expect("set DEN_EMBED_TEST_MODEL_DIR to a dir with model_int8.onnx + tokenizer.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_den-embed"))
-        .env("DEN_EMBED_PORT", "0")
-        .env("DEN_EMBED_HOST", "127.0.0.1")
+        .env("PORT", "0")
         .env("DEN_EMBED_MODEL_DIR", &model_dir)
         .env("DEN_EMBED_IDLE_UNLOAD_SEC", "0") // always-warm: load at boot, so the request is the slow part
         // A SHORT grace, so the deadline fires well before the batch finishes. At the 8s default the

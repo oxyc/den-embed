@@ -60,8 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
 COPY --from=build /src/target/release/den-embed /app/den-embed
 COPY --from=model /models /models
 
-ENV DEN_EMBED_HOST=0.0.0.0 \
-    DEN_EMBED_PORT=8080 \
+ENV PORT=8080 \
     DEN_EMBED_MODEL_DIR=/models \
     DEN_EMBED_MAX_CHARS=8000 \
     # Cap glibc's per-thread arenas so freed memory stays in few arenas that
