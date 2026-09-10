@@ -686,16 +686,31 @@ async fn json_error(resp: Response) -> Response {
 /// `LOG_REQUESTS` is on.
 async fn log_request(req: Request, next: Next) -> Response {
     let (method, uri) = (req.method().clone(), req.uri().clone());
+    let rid = request_id(req.headers());
     let started = Instant::now();
     let resp = next.run(req).await;
-    tracing::info!("{}", request_line(&method, &uri, resp.status(), started.elapsed()));
+    tracing::info!("{}", request_line(&method, &uri, resp.status(), started.elapsed(), rid.as_deref()));
     resp
 }
 
-/// `<METHOD> <path> <status> <ms>ms`, with the path alone: the query of `GET /embed?text=` is the
-/// user's search, and it must never reach a log.
-fn request_line(method: &Method, uri: &Uri, status: StatusCode, took: Duration) -> String {
-    format!("{method} {} {} {}ms", uri.path(), status.as_u16(), took.as_millis())
+/// `<METHOD> <path> <status> <ms>ms[ rid=<id>]`, with the path alone: the query of `GET /embed?text=` is
+/// the user's search, and it must never reach a log. `rid` is the caller's `X-Request-Id`, so a line here
+/// can be joined to the app's (and den-atlas's) line for the same request.
+fn request_line(method: &Method, uri: &Uri, status: StatusCode, took: Duration, rid: Option<&str>) -> String {
+    let line = format!("{method} {} {} {}ms", uri.path(), status.as_u16(), took.as_millis());
+    match rid {
+        Some(rid) => format!("{line} rid={rid}"),
+        None => line,
+    }
+}
+
+/// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is client input going
+/// into a log line, so nothing in it may break the line or pass for another field. Empty ⇒ absent.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let id: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(32).collect();
+    (!id.is_empty()).then_some(id)
 }
 
 fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
@@ -1422,9 +1437,38 @@ mod tests {
     #[test]
     fn the_request_log_never_carries_the_query() {
         let uri: Uri = "/embed?text=a%20private%20search".parse().unwrap();
-        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(12));
+        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(12), None);
         assert_eq!(line, "GET /embed 200 12ms");
         assert!(!line.contains("private"), "{line}");
+    }
+
+    /// The caller's request id closes the line, so it can be joined to the app's line for the request.
+    #[test]
+    fn the_request_log_carries_the_callers_request_id() {
+        let uri: Uri = "/embed?text=x".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("a1B2-c3_d4"));
+        let rid = request_id(&headers);
+        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(3), rid.as_deref());
+        assert_eq!(line, "GET /embed 200 3ms rid=a1B2-c3_d4");
+    }
+
+    /// It is client input going into a log line: anything that could break the line or pose as another
+    /// field is dropped, and a flood is cut to 32 characters. Nothing usable left means no `rid=` at all.
+    #[test]
+    fn a_hostile_request_id_is_sanitized_truncated_or_dropped() {
+        let id = |v: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-request-id", HeaderValue::from_static(v));
+            request_id(&headers)
+        };
+        assert_eq!(id("ab c=d\tGET /x 200").as_deref(), Some("abcdGETx200"));
+        assert_eq!(
+            id("0123456789abcdef0123456789abcdefXYZ").as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(id(" =/ "), None);
+        assert_eq!(request_id(&HeaderMap::new()), None);
     }
 
     async fn scrape(state: Arc<AppState>, auth: Option<&str>) -> (StatusCode, String, String) {
