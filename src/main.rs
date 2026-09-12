@@ -436,6 +436,27 @@ fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow
     texts.iter().map(|t| embed_one(state, t, phases)).collect()
 }
 
+/// Snapshot a batch that needs no inference before loading the tokenizer/model for admission. Keeping
+/// the vectors, rather than checking membership and reading them later, makes cache eviction harmless.
+fn cached_batch(state: &AppState, texts: &[String], phases: &mut Phases) -> Option<Vec<Vec<i32>>> {
+    let mut cache = lock(&state.cache);
+    let mut hits = 0;
+    let vectors = texts
+        .iter()
+        .map(|text| {
+            if is_blank(text) {
+                return Some(zero_vector());
+            }
+            let truncated: String = text.chars().take(state.cfg.max_chars).collect();
+            let vector = cache.get(&cache_key(&truncated))?;
+            hits += 1;
+            Some(vector)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    phases.cache_hits += hits;
+    Some(vectors)
+}
+
 /// The batch's real token count, capped per text exactly as inference will cap it.
 ///
 /// Counting `min(chars, max_tokens)` instead was UNSOUND, and not marginally: the tokenizer's
@@ -826,11 +847,17 @@ async fn embed_batch(
     // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
     // `count_tokens`), which let 5x the budget through.
     let texts_for_count = body.texts.clone();
-    let (total, phases) = run_blocking(&state, move |st| {
+    let (cached, total, phases) = run_blocking(&state, move |st| {
         let mut phases = Phases::default();
-        count_tokens(st, &texts_for_count, &mut phases).map(|n| (n, phases))
+        if let Some(vectors) = cached_batch(st, &texts_for_count, &mut phases) {
+            return Ok((Some(vectors), 0, phases));
+        }
+        count_tokens(st, &texts_for_count, &mut phases).map(|n| (None, n, phases))
     })
     .await?;
+    if let Some(vectors) = cached {
+        return Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })));
+    }
     if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1379,6 +1406,56 @@ mod tests {
             let body = body_json(resp).await;
             assert_eq!(body["error"], slug, "{body}");
         }
+    }
+
+    /// Cache-only work remains available even while the model is unloaded or its files are absent.
+    #[tokio::test]
+    async fn empty_blank_and_cached_batches_do_not_load_the_model() {
+        let mut state = metrics_state(None);
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.cfg.onnx_path = "/missing-den-embed-test-model.onnx".into();
+        st.cfg.tokenizer_path = "/missing-den-embed-test-tokenizer.json".into();
+        st.cfg.max_chars = 4;
+        st.cfg.max_request_tokens = 1;
+        *lock(&st.cache) = Lru::new(1);
+        let cached = vec![7; DIMS];
+        lock(&st.cache).put(cache_key("hola"), cached.clone());
+        for (texts, expected) in [
+            (serde_json::json!([]), vec![]),
+            (serde_json::json!(["", " \t\n"]), vec![zero_vector(), zero_vector()]),
+            (serde_json::json!(["hola longer", " ", "hola"]), vec![cached.clone(), zero_vector(), cached]),
+        ] {
+            let request = serde_json::json!({ "texts": texts }).to_string();
+            let resp = send(state.clone(), Method::POST, "/embed/batch", "application/json", &request).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{texts}");
+            assert!(!header(&resp, "server-timing").contains("load;"));
+            let body = body_json(resp).await;
+            assert_eq!(body["vectors"], serde_json::json!(expected));
+            assert_eq!(body["dims"], DIMS);
+            assert!(lock(&state.model).is_none());
+            assert!(!state.load_failing.load(Ordering::Relaxed));
+            assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_cache_miss_still_requires_model_admission() {
+        let mut state = metrics_state(None);
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.cfg.onnx_path = "/missing-den-embed-test-model.onnx".into();
+        st.cfg.tokenizer_path = "/missing-den-embed-test-tokenizer.json".into();
+        lock(&st.cache).put(cache_key("cached"), zero_vector());
+        let resp = send(
+            state.clone(),
+            Method::POST,
+            "/embed/batch",
+            "application/json",
+            r#"{"texts":["cached","uncached"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"], "embedding_failed");
+        assert!(state.load_failing.load(Ordering::Relaxed));
     }
 
     /// A batch over the limit names itself, with the numbers in `detail`.
