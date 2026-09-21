@@ -14,6 +14,10 @@ on:
       image:
         description: The exact image the homelab is running, by digest
         required: true
+      threads:
+        description: INTRA_THREADS to pin ONNX Runtime to (0 = all cores, the default)
+        required: true
+        default: '0'
 
 jobs:
   embed:
@@ -28,7 +32,8 @@ jobs:
 
       - name: Start den-embed
         run: |
-          docker run -d --name den-embed -p 8080:8080 '${{ inputs.image }}'
+          nproc
+          docker run -d --name den-embed -p 8080:8080 -e INTRA_THREADS='${{ inputs.threads }}' '${{ inputs.image }}'
           for i in $(seq 1 90); do
             if curl -fsS -m 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then echo "up after ${i}s"; break; fi
             sleep 1
