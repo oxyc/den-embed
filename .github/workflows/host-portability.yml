@@ -18,6 +18,10 @@ on:
         description: INTRA_THREADS to pin ONNX Runtime to (0 = all cores, the default)
         required: true
         default: '0'
+      max_tokens:
+        description: MAX_TOKENS — part of the embedder identity; the homelab serves 1024
+        required: true
+        default: '1024'
 
 jobs:
   embed:
@@ -33,7 +37,7 @@ jobs:
       - name: Start den-embed
         run: |
           nproc
-          docker run -d --name den-embed -p 8080:8080 -e INTRA_THREADS='${{ inputs.threads }}' '${{ inputs.image }}'
+          docker run -d --name den-embed -p 8080:8080 -e INTRA_THREADS='${{ inputs.threads }}' -e MAX_TOKENS='${{ inputs.max_tokens }}' '${{ inputs.image }}'
           for i in $(seq 1 90); do
             if curl -fsS -m 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then echo "up after ${i}s"; break; fi
             sleep 1
