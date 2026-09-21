@@ -1,0 +1,114 @@
+name: host-portability
+
+# Does this image produce the SAME vectors on a GitHub runner as it does on the homelab?
+#
+# It decides where den-dataset's pipeline can run (oxyc/den-dataset#27). Corpus vectors and the query
+# vectors den-atlas forwards here at serve time have to live in one space: oxyc/den-dataset#21 is what it
+# costs when they do not — 37% of search results were embedder drift. If this image is host-portable the
+# pipeline can run in Actions; if it is not, embedding is pinned to the box that serves it.
+#
+# Manual only. It answers a question, it does not guard a change.
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: The exact image the homelab is running, by digest
+        required: true
+
+jobs:
+  embed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: What CPU is this
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx|avx2|avx512f|amx)' | tr '\n' ' ' || true
+          echo
+          uname -m
+
+      - name: Start den-embed
+        run: |
+          docker run -d --name den-embed -p 8080:8080 '${{ inputs.image }}'
+          for i in $(seq 1 90); do
+            if curl -fsS -m 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then echo "up after ${i}s"; break; fi
+            sleep 1
+          done
+          curl -fsS -m 10 http://127.0.0.1:8080/health
+
+      - name: Embed the fixed set
+        run: |
+          cat > probe.py <<'PROBE'
+          #!/usr/bin/env python3
+          """Embed a FIXED set of texts through den-embed and print them as JSON.
+
+          The texts are generated here rather than read from a file so this script is the whole experiment: run it
+          against den-embed on the homelab and against the same image in a GitHub Actions runner, and diff the two
+          outputs. Anything that differs is the embedder's dependence on the host it ran on.
+
+          The set is chosen to be adversarial about that: short and long, ASCII and not, repeated tokens, numbers,
+          and text near the token cap — the places where a different SIMD kernel or a different reduction order has
+          room to disagree.
+          """
+          import json
+          import sys
+          import urllib.request
+
+          URL = sys.argv[1] if len(sys.argv) > 1 else "http://den-embed:8080/embed"
+
+          WORDS = ("heist coastal town quiet betrayal winter harbour letter brother debt "
+                   "inheritance fog crossing witness trial mountain summer radio silence").split()
+
+
+          def texts():
+              out = ["a quiet heist in a coastal town"]
+              # Deterministic filler across a range of lengths: index picks the words, so it is reproducible
+              # anywhere without shipping a corpus.
+              for i in range(1, 181):
+                  n = 3 + (i * 7) % 60
+                  out.append(" ".join(WORDS[(i * j + j) % len(WORDS)] for j in range(n)))
+              out += [
+                  "",
+                  " ",
+                  "x",
+                  "Ω≈ç√∫˜µ≤≥÷ åß∂ƒ©˙∆˚¬…æ",
+                  "君の名は。 風の谷のナウシカ 東京喰種トーキョーグール",
+                  "Le Cinquième Élément — Trois couleurs : Rouge — ¡Vente a Alemania, Pepe!",
+                  "1234567890 " * 40,
+                  "the same word " * 120,
+                  " ".join(WORDS) * 60,
+              ]
+              return out
+
+
+          def embed(text):
+              body = json.dumps({"text": text}).encode()
+              req = urllib.request.Request(URL, data=body, headers={"content-type": "application/json"})
+              with urllib.request.urlopen(req, timeout=180) as resp:
+                  return json.load(resp)
+
+
+          def main():
+              rows = []
+              for i, text in enumerate(texts()):
+                  got = embed(text)
+                  vec = got.get("vector") or got.get("embedding")
+                  rows.append({"i": i, "len": len(text), "dims": got.get("dims"),
+                               "model": got.get("model"), "vector": vec})
+                  if i % 40 == 0:
+                      print(f"  {i} embedded", file=sys.stderr)
+              json.dump(rows, sys.stdout)
+
+
+          main()
+          PROBE
+          python3 probe.py http://127.0.0.1:8080/embed > actions-vectors.json
+          wc -c actions-vectors.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: actions-vectors
+          path: actions-vectors.json
+
+      - name: den-embed log
+        if: always()
+        run: docker logs den-embed 2>&1 | tail -20
