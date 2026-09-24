@@ -109,7 +109,7 @@ jobs:
           python3 probe.py http://127.0.0.1:8080/embed > actions-sweep.json
           wc -c actions-sweep.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: actions-sweep
           path: actions-sweep.json
