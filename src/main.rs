@@ -58,6 +58,21 @@ const DIMS: usize = 1024;
 /// predates the field entirely and reads back as 0, which is correctly not equal to this.
 const VECTOR_EPOCH: u32 = 1;
 
+/// The release carried by the runtime image (`DEN_VERSION`, set from the VERSION file at image build). Keeping it
+/// out of Cargo.toml means a release does not invalidate the dependency build layer merely to change a tag.
+/// Developer builds and tests have no image metadata, so they fall back to the package version.
+fn release_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
+
 /// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
 /// into `anyhow::Error` directly; map it through its Display.
 ///
@@ -605,7 +620,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
         model: MODEL_LABEL,
         dims: DIMS,
         vector_epoch: VECTOR_EPOCH,
-        runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
+        runtime: format!("den-embed/{}", release_version()),
         max_tokens: state.cfg.max_tokens,
     })
 }
@@ -789,7 +804,7 @@ embed_idle_seconds {idle_secs}
 # TYPE embed_idle_unload_seconds gauge
 embed_idle_unload_seconds {unload_secs}
 ",
-        version = env!("CARGO_PKG_VERSION"),
+        version = release_version(),
         loaded = u8::from(loaded),
     )
 }
@@ -964,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = shutdown_signal();
     // The BOUND port, not the configured one: tests/shutdown.rs starts on port 0 and reads it here.
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    tracing::info!("den-embed {} listening on :{bound} — {settings}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("den-embed {} listening on :{bound} — {settings}", release_version());
 
     let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
     match &outcome {
@@ -1208,7 +1223,7 @@ mod tests {
             model: MODEL_LABEL,
             dims: DIMS,
             vector_epoch: VECTOR_EPOCH,
-            runtime: format!("den-embed/{}", env!("CARGO_PKG_VERSION")),
+            runtime: format!("den-embed/{}", release_version()),
             max_tokens: 512,
         })
         .unwrap();
@@ -1217,7 +1232,7 @@ mod tests {
         assert_eq!(body["dims"], DIMS);
         assert_eq!(body["max_tokens"], 512);
         assert_eq!(body["vector_epoch"], VECTOR_EPOCH);
-        assert_eq!(body["runtime"], format!("den-embed/{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(body["runtime"], format!("den-embed/{}", release_version()));
         assert_ne!(body["runtime"], "den-embed/");
     }
 
@@ -1667,7 +1682,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
         let build_info =
-            format!("embed_build_info{{version=\"{}\",model=\"bge-m3\"}} 1\n", env!("CARGO_PKG_VERSION"));
+            format!("embed_build_info{{version=\"{}\",model=\"bge-m3\"}} 1\n", release_version());
         assert!(body.contains(&build_info), "no build_info line in:\n{body}");
         assert!(body.contains("\nembed_idle_unload_seconds 600\n"), "{body}");
         assert!(body.contains("# TYPE embed_model_loaded gauge\n"), "{body}");

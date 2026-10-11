@@ -48,6 +48,17 @@ RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
     && echo "${MODEL_SHA256}  model_int8.onnx" | sha256sum -c - \
     && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
+# ---- release metadata -------------------------------------------------------------
+# The release version (the VERSION file, passed as DEN_VERSION) reaches only the last, tiny layers of the
+# runtime image. It is deliberately NOT in Cargo.toml and not in any stage above, so a version bump
+# invalidates neither the dependency/compile layers nor the model layer. The marker file makes a missing or
+# malformed version fail the build before an image can be pushed.
+FROM debian:trixie-slim AS release-metadata
+ARG DEN_VERSION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
+    printf '%s' "$DEN_VERSION" > /den-version
+
 # ---- runtime --------------------------------------------------------------------
 FROM debian:trixie-slim
 WORKDIR /app
@@ -72,6 +83,14 @@ ENV PORT=8080 \
 # Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532). Nothing here
 # writes to disk: the model is read from /models and the embedding cache lives in memory.
 RUN useradd --system --uid 65532 --user-group --no-create-home nonroot
+
+# Last, so the per-release values touch nothing above. The service reads DEN_VERSION at run time.
+ARG DEN_VERSION
+ARG GIT_REVISION
+ENV DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
+COPY --from=release-metadata /den-version /app/den-version
 
 EXPOSE 8080
 USER 65532:65532

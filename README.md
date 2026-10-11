@@ -115,8 +115,12 @@ captured from the Python service predate the ONNX Runtime 1.28 move and no longe
 On the homelab box it runs as a rootful-podman Quadlet container in the `den` stack — see the den
 repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as
 `http://den-embed:8080` on `den.network`, capped at 1536 MiB, running as uid 65532 with the model
-baked into the image. Images publish on a `v*` tag, and `den-update` picks up the new `:latest`
-within a day, proving it by embedding a string before pinning its digest.
+baked into the image. Main CI builds, probes and scans an immutable candidate image for every commit.
+Run `scripts/release.sh X.Y.Z` to write `VERSION` and create `vX.Y.Z` once that exact main CI has
+passed; the tag workflow verifies, signs and promotes the same digest without rebuilding. `den-update`
+picks up the new `:latest` within a day, proving it by embedding a string before pinning its digest.
+The release version lives in `VERSION` and reaches the service as `DEN_VERSION`; `Cargo.toml`'s version
+is not bumped, so a release does not recompile the dependencies.
 
 **Release images.** `docker-publish` also runs every Monday: it rebuilds the newest `v*` tag (never
 `main`) with the base images re-pulled, no build cache and a fresh `apt-get upgrade`, and publishes it as

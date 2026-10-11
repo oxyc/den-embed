@@ -74,14 +74,25 @@ change, a pooling or normalisation change.
 
 ## Releasing — READ THIS: code on `main` ≠ running on the box
 
-`.github/workflows/docker-publish.yml` builds + pushes `ghcr.io/oxyc/den-embed` **only on a `v*`
-tag** or a manual `workflow_dispatch`, after running the whole of `ci.yml` against the tagged commit,
-and refuses a tag that is not `v` + Cargo.toml's version. A push to `main` runs **tests only — no
-image**. So a merged change does NOT reach the box until you cut a release:
+Main CI (`ci.yml`) tests, builds, probes and scans an unsigned `candidate-<sha>` image for every main
+commit and records its digest. `docker-publish.yml` promotes **only on a `v*` tag** (or the Monday /
+manual patch rebuild): it finds that exact successful main run, verifies the digest, signs it and moves
+`:X.Y.Z`, `:X.Y`, `:X`, `:sha-<7>` and `:latest` — no second compile, no second test run. It refuses a
+tag that is not `v` + the `VERSION` file. So a merged change does NOT reach the box until you cut a
+release:
 
 ```
-git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z     # → :X.Y.Z, :X.Y, :X, :<sha> and :latest
+scripts/release.sh X.Y.Z
 ```
+
+It commits only `VERSION`, pushes, waits for that commit's main CI, tags, and waits for the promotion.
+**Never bump `Cargo.toml`'s version for a release**: the service reads the release from the `DEN_VERSION`
+env baked into the image (`release_version()` in `src/main.rs`; the crate version is only the fallback
+for `cargo run`), and a manifest change would invalidate the dependency build layer for nothing.
+The version arrives in the Dockerfile's last layers, so a release reuses the cached compile and model
+layers. The Monday patch rebuild is unchanged in spirit: newest tag, no cache, OS-package scan gate,
+and it needs a tag that already has `VERSION` and `docker-bake.hcl` (the first release after this
+pipeline landed must be cut before it runs).
 
 Then `den-update` on the box picks up the new `:latest` within a day (a daily timer; it proves the
 image by embedding a string, pins its digest and restarts — see the den repo's `deploy/README.md`),
