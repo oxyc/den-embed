@@ -1,5 +1,12 @@
 # den-embed
 
+> **Archived:** the maintained engine and compatibility service moved to
+> [`oxyc/den-atlas`](https://github.com/oxyc/den-atlas/tree/main/embed). Releases now publish
+> `ghcr.io/oxyc/den-atlas-embed`; the deployed service and HTTP API are still named `den-embed`.
+> `oxyc/den-dataset` owns the byte-exact corpus compatibility gate and exact production image digest.
+> This repository and `ghcr.io/oxyc/den-embed` are historical and must not be used for new releases or
+> deployments.
+
 The embedding service behind Den's semantic search: **BAAI/bge-m3**, int8, 1024 dims, served over
 HTTP by a small Rust binary (axum + ONNX Runtime via `ort` + HuggingFace `tokenizers`). den-atlas
 calls it to embed search queries; den-dataset runs the same image to embed the corpus.
